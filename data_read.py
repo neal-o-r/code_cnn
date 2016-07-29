@@ -27,7 +27,10 @@ def data_and_labels(filenames):
 		lab = [[no, int(not(no))] for i in range(char_arr.shape[0])]
 		texts = np.vstack((texts, char_arr))
 		labels.extend(lab)	
-			
+
+	for i, v in enumerate(np.unique(texts)):
+    		texts[np.where(texts == v)] = i
+				
 	
 	return texts, labels
 
