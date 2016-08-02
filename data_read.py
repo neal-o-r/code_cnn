@@ -1,5 +1,5 @@
 import numpy as np
-
+import os
 
 def file_string(filename):
 
@@ -8,10 +8,14 @@ def file_string(filename):
 		return f.read()		
 
 
-def data_and_labels(filenames):
+def data_and_labels():
 
-	n   = 200
-	cut = 100
+	filenames = filter(lambda x: not x.startswith('.'), 
+	            filter(os.path.isfile, ['data/'+i for i in os.listdir('data')])) 
+	# yo dawg i heard you like filter...
+	
+	n   = 200 # block size 
+	cut = 100 # optional thinning parameter
 
 	texts  = np.zeros((0,200)) 
 	labels = []
@@ -30,11 +34,10 @@ def data_and_labels(filenames):
 
 	for i, v in enumerate(np.unique(texts)):
     		texts[np.where(texts == v)] = i
-				
-	
+					
 	return texts, labels
 
-def batch_iter(data, batch_size, num_epochs, shuffle=True):
+def batch_iter(data, batch_size, num_epochs):
     """
     Generates a batch iterator for a dataset.
     """
@@ -43,14 +46,10 @@ def batch_iter(data, batch_size, num_epochs, shuffle=True):
     num_batches_per_epoch = int(len(data)/batch_size) + 1
     for epoch in range(num_epochs):
         # Shuffle the data at each epoch
-        if shuffle:
-            shuffle_indices = np.random.permutation(np.arange(data_size))
-            shuffled_data = data[shuffle_indices]
-        else:
-            shuffled_data = data
+	shuffle_indices = np.random.permutation(np.arange(data_size))
+     	shuffled_data = data[shuffle_indices]
+        
         for batch_num in range(num_batches_per_epoch):
             start_index = batch_num * batch_size
             end_index = min((batch_num + 1) * batch_size, data_size)
             yield shuffled_data[start_index:end_index]
-
-
