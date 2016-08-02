@@ -16,8 +16,8 @@ tf.flags.DEFINE_float("dropout_keep_prob", 0.5, "Dropout keep probability (defau
 tf.flags.DEFINE_float("l2_reg_lambda", 0.0, "L2 regularizaion lambda (default: 0.0)")
 
 # Training parameters
-tf.flags.DEFINE_integer("batch_size", 64, "Batch Size (default: 64)")
-tf.flags.DEFINE_integer("num_epochs", 1, "Number of training epochs (default: 100)")
+tf.flags.DEFINE_integer("batch_size", 100, "Batch Size (default: 64)")
+tf.flags.DEFINE_integer("num_epochs", 10, "Number of training epochs (default: 100)")
 tf.flags.DEFINE_integer("evaluate_every", 100, "Evaluate model on dev set after this many steps (default: 100)")
 tf.flags.DEFINE_integer("checkpoint_every", 100, "Save model after this many steps (default: 100)")
 # Misc Parameters
@@ -103,7 +103,7 @@ with tf.Graph().as_default():
                 [train_op, global_step, train_summary_op, cnn.loss, cnn.accuracy],
                 feed_dict)
             
-            print("step {}, loss {:g}, acc {:g}".format(step, loss, accuracy))
+           # print("step {}, loss {:g}, acc {:g}".format(step, loss, accuracy))
 
         def dev_step(x_batch, y_batch):
             """
@@ -131,7 +131,7 @@ with tf.Graph().as_default():
                 print("\nEvaluation:")
                 dev_step(x_dev, y_dev)
                 print("")
-	    if current_step == int(len(x_train)/FLAGS.batch_size) + 1:
+	    if current_step == FLAGS.num_epochs*(int(len(x_train)/FLAGS.batch_size)+1):
 		path = saver.save(sess, out_dir, global_step=current_step)
 		print("Saved model to {}\n".format(path))
 		
