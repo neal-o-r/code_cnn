@@ -30,7 +30,8 @@ FLAGS._parse_flags()
 
 
 features, labels = dtr.data_and_labels()
-labels = np.array(labels)
+labels = np.array(labels)[:4000]
+features = features[:4000]
 
 # Randomly shuffle data
 np.random.seed(123)
@@ -38,8 +39,8 @@ shuffle_indices = np.random.permutation(np.arange(len(labels)))
 x_shuffled = features[shuffle_indices]
 y_shuffled = labels[shuffle_indices]
 
-x_train, x_dev = x_shuffled[:-1000], x_shuffled[-1000:]
-y_train, y_dev = y_shuffled[:-1000], y_shuffled[-1000:]
+x_train, x_dev = x_shuffled[:-200], x_shuffled[-200:]
+y_train, y_dev = y_shuffled[:-200], y_shuffled[-200:]
 
 vocab = len(np.unique(features))
 
