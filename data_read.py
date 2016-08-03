@@ -28,7 +28,9 @@ def data_and_labels():
 		char_arr = char_arr.reshape((len(char_arr)+1)//n, n)		
 		#char_arr = char_arr[:cut]
 		
-		lab = [[no, int(not(no))] for i in range(char_arr.shape[0])]
+		lab = [0]*len(filenames)
+		lab[no] = 1
+		lab = [lab] * char_arr.shape[0]
 		texts = np.vstack((texts, char_arr))
 		labels.extend(lab)	
 
