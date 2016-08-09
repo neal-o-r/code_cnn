@@ -1,0 +1,6 @@
+Python,https://github.com/vinta/awesome-python,.py
+PHP,https://github.com/laravel/laravel,.php
+Ruby,https://github.com/rails/rails,.rb
+Javascript,https://github.com/facebook/react,.js
+Haskell,https://github.com/facebook/Haxl,.hs
+Haskell,https://github.com/commercialhaskell/stack,.hs
