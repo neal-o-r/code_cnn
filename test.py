@@ -33,7 +33,7 @@ print("\nEvaluating...\n")
 
 # Evaluation
 # ==================================================
-checkpoint_file = 'outs-1240'
+checkpoint_file = 'outs-5600'
 graph = tf.Graph()
 with graph.as_default():
     session_conf = tf.ConfigProto(

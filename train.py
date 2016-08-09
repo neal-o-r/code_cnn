@@ -16,8 +16,8 @@ tf.flags.DEFINE_float("dropout_keep_prob", 0.5, "Dropout keep probability (defau
 tf.flags.DEFINE_float("l2_reg_lambda", 0.0, "L2 regularizaion lambda (default: 0.0)")
 
 # Training parameters
-tf.flags.DEFINE_integer("batch_size", 100, "Batch Size (default: 64)")
-tf.flags.DEFINE_integer("num_epochs", 10, "Number of training epochs (default: 100)")
+tf.flags.DEFINE_integer("batch_size", 64, "Batch Size (default: 64)")
+tf.flags.DEFINE_integer("num_epochs", 100, "Number of training epochs (default: 100)")
 tf.flags.DEFINE_integer("evaluate_every", 100, "Evaluate model on dev set after this many steps (default: 100)")
 tf.flags.DEFINE_integer("checkpoint_every", 100, "Save model after this many steps (default: 100)")
 # Misc Parameters
@@ -30,8 +30,9 @@ FLAGS._parse_flags()
 
 
 features, labels = dtr.data_and_labels()
-labels = np.array(labels)[:4000]
-features = features[:4000]
+labels = np.array(labels)
+vocab = 103
+
 
 # Randomly shuffle data
 np.random.seed(123)
@@ -39,10 +40,10 @@ shuffle_indices = np.random.permutation(np.arange(len(labels)))
 x_shuffled = features[shuffle_indices]
 y_shuffled = labels[shuffle_indices]
 
-x_train, x_dev = x_shuffled[:-200], x_shuffled[-200:]
-y_train, y_dev = y_shuffled[:-200], y_shuffled[-200:]
+x_train, x_dev = x_shuffled[:-400], x_shuffled[-400:]
+y_train, y_dev = y_shuffled[:-400], y_shuffled[-400:]
 
-vocab = len(np.unique(features))
+
 
 
 # Training

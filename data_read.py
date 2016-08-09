@@ -15,7 +15,7 @@ def data_and_labels():
 	# yo dawg i heard you like filter...
 	
 	n   = 200 # block size 
-	cut = 100 # optional thinning parameter
+	cut = 2000 # optional thinning parameter
 
 	texts  = np.zeros((0,200)) 
 	labels = []
@@ -23,10 +23,11 @@ def data_and_labels():
 
 		f_str = file_string(filename)
 
+#		f_str = f_str[:cut*n]	
+
 		char_arr = np.array([ord(i) for i in f_str])
 		char_arr = char_arr[:len(char_arr)//200 *200]
 		char_arr = char_arr.reshape((len(char_arr)+1)//n, n)		
-		#char_arr = char_arr[:cut]
 		
 		lab = [0]*len(filenames)
 		lab[no] = 1
