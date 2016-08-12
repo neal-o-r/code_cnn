@@ -8,14 +8,13 @@ def file_string(filename):
 		return f.read()		
 
 
-def data_and_labels():
+def data_and_labels(cut=2000):
 
 	filenames = filter(lambda x: not x.startswith('.'), 
 	            filter(os.path.isfile, ['data/'+i for i in os.listdir('data')])) 
 	# yo dawg i heard you like filter...
 	
-	n   = 200 # block size 
-	cut = 2000 # optional thinning parameter
+	n = 200 # block size 
 
 	texts  = np.zeros((0,200)) 
 	labels = []
@@ -23,7 +22,8 @@ def data_and_labels():
 
 		f_str = file_string(filename)
 
-#		f_str = f_str[:cut*n]	
+		if cut != 0: # a cut of zero returns everything
+			f_str = f_str[:cut*n]	
 
 		char_arr = np.array([ord(i) for i in f_str])
 		char_arr = char_arr[:len(char_arr)//200 *200]
