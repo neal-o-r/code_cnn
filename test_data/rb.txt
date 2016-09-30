@@ -1,0 +1,3387 @@
+ntroller.prepend_view_path "baz"
+    assert_paths("baz", FIXTURE_LOAD_PATH)
+
+    @controller.prepend_view_path(%w(foo bar))
+    assert_paths "foo", "bar", "baz", FIXTURE_LOAD_PATH
+
+    @controller.prepend_view_path(FIXTURE_LOAD_PATH)
+    assert_paths FIXTURE_LOAD_PATH, "foo", "bar", "baz", FIXTURE_LOAD_PATH
+  end
+
+  def test_template_appends_view_path_correctly
+    @controller.instance_variable_set :@template, ActionView::Base.new(TestController.view_paths, {}, @controller)
+    class_view_paths = TestController.view_paths
+
+    @controller.append_view_path "foo"
+    assert_paths FIXTURE_LOAD_PATH, "foo"
+
+    @controller.append_view_path(%w(bar baz))
+    assert_paths FIXTURE_LOAD_PATH, "foo", "bar", "baz"
+    assert_paths TestController, *class_view_paths
+  end
+
+  def test_template_prepends_view_path_correctly
+    @controller.instance_variable_set :@template, ActionView::Base.new(TestController.view_paths, {}, @controller)
+    class_view_paths = TestController.view_paths
+
+    @controller.prepend_view_path "baz"
+    assert_paths "baz", FIXTURE_LOAD_PATH
+
+    @controller.prepend_view_path(%w(foo bar))
+    assert_paths "foo", "bar", "baz", FIXTURE_LOAD_PATH
+    assert_paths TestController, *class_view_paths
+  end
+
+  def test_view_paths
+    get :hello_world
+    assert_response :success
+    assert_equal "Hello world!", @response.body
+  end
+
+  def test_view_paths_override
+    TestController.prepend_view_path "#{FIXTURE_LOAD_PATH}/override"
+    get :hello_world
+    assert_response :success
+    assert_equal "Hello overridden world!", @response.body
+  end
+
+  def test_view_paths_override_for_layouts_in_controllers_with_a_module
+    @controller = Test::SubController.new
+    Test::SubController.view_paths = [ "#{FIXTURE_LOAD_PATH}/override", FIXTURE_LOAD_PATH, "#{FIXTURE_LOAD_PATH}/override2" ]
+    get :hello_world
+    assert_response :success
+    assert_equal "layout: Hello overridden world!", @response.body
+  end
+
+  def test_view_paths_override_at_request_time
+    get :hello_world_at_request_time
+    assert_response :success
+    assert_equal "Hello overridden world!", @response.body
+  end
+
+  def test_decorate_view_paths_with_custom_resolver
+    decorator_class = Class.new(ActionView::PathResolver) do
+      def initialize(path_set)
+        @path_set = path_set
+      end
+
+      def find_all(*args)
+        @path_set.find_all(*args).collect do |template|
+          ::ActionView::Template.new(
+            "Decorated body",
+            template.identifier,
+            template.handler,
+                          virtual_path: template.virtual_path,
+              format: template.formats
+          )
+        end
+      end
+    end
+
+    decorator = decorator_class.new(TestController.view_paths)
+    TestController.view_paths = ActionView::PathSet.new.push(decorator)
+
+    get :hello_world
+    assert_response :success
+    assert_equal "Decorated body", @response.body
+  end
+
+  def test_inheritance
+    original_load_paths = ActionController::Base.view_paths
+
+    self.class.class_eval %{
+      class A < ActionController::Base; end
+      class B < A; end
+      class C < ActionController::Base; end
+    }
+
+    A.view_paths = ["a/path"]
+
+    assert_paths A, "a/path"
+    assert_paths A, *B.view_paths
+    assert_paths C, *original_load_paths
+
+    C.view_paths = []
+    assert_nothing_raised { C.append_view_path "c/path" }
+    assert_paths C, "c/path"
+  end
+
+  def test_lookup_context_accessor
+    assert_equal ["test"], TestController.new.lookup_context.prefixes
+  end
+end
+require "cases/helper"
+require "models/book"
+require "support/schema_dumping_helper"
+
+module ViewBehavior
+  include SchemaDumpingHelper
+  extend ActiveSupport::Concern
+
+  included do
+    fixtures :books
+  end
+
+  class Ebook < ActiveRecord::Base
+    self.primary_key = "id"
+  end
+
+  def setup
+    super
+    @connection = ActiveRecord::Base.connection
+    create_view "ebooks", <<-SQL
+      SELECT id, name, status FROM books WHERE format = 'ebook'
+    SQL
+  end
+
+  def teardown
+    super
+    drop_view "ebooks"
+  end
+
+  def test_reading
+    books = Ebook.all
+    assert_equal [books(:rfr).id], books.map(&:id)
+    assert_equal ["Ruby for Rails"], books.map(&:name)
+  end
+
+  def test_views
+    assert_equal [Ebook.table_name], @connection.views
+  end
+
+  def test_view_exists
+    view_name = Ebook.table_name
+    assert @connection.view_exists?(view_name), "'#{view_name}' view should exist"
+  end
+
+  def test_table_exists
+    view_name = Ebook.table_name
+    # TODO: switch this assertion around once we changed #tables to not return views.
+    ActiveSupport::Deprecation.silence { assert @connection.table_exists?(view_name), "'#{view_name}' table should exist" }
+  end
+
+  def test_views_ara_valid_data_sources
+    view_name = Ebook.table_name
+    assert @connection.data_source_exists?(view_name), "'#{view_name}' should be a data source"
+  end
+
+  def test_column_definitions
+    assert_equal([["id", :integer],
+                  ["name", :string],
+                  ["status", :integer]], Ebook.columns.map { |c| [c.name, c.type] })
+  end
+
+  def test_attributes
+    assert_equal({"id" => 2, "name" => "Ruby for Rails", "status" => 0},
+                 Ebook.first.attributes)
+  end
+
+  def test_does_not_assume_id_column_as_primary_key
+    model = Class.new(ActiveRecord::Base) do
+      self.table_name = "ebooks"
+    end
+    assert_nil model.primary_key
+  end
+
+  def test_does_not_dump_view_as_table
+    schema = dump_table_schema "ebooks"
+    assert_no_match %r{create_table "ebooks"}, schema
+  end
+end
+
+if ActiveRecord::Base.connection.supports_views?
+  class ViewWithPrimaryKeyTest < ActiveRecord::TestCase
+    include ViewBehavior
+
+    private
+      def create_view(name, query)
+        @connection.execute "CREATE VIEW #{name} AS #{query}"
+      end
+
+      def drop_view(name)
+        @connection.execute "DROP VIEW #{name}" if @connection.view_exists? name
+      end
+  end
+
+  class ViewWithoutPrimaryKeyTest < ActiveRecord::TestCase
+    include SchemaDumpingHelper
+    fixtures :books
+
+    class Paperback < ActiveRecord::Base; end
+
+    setup do
+      @connection = ActiveRecord::Base.connection
+      @connection.execute <<-SQL
+      CREATE VIEW paperbacks
+        AS SELECT name, status FROM books WHERE format = 'paperback'
+    SQL
+    end
+
+    teardown do
+      @connection.execute "DROP VIEW paperbacks" if @connection.view_exists? "paperbacks"
+    end
+
+    def test_reading
+      books = Paperback.all
+      assert_equal ["Agile Web Development with Rails"], books.map(&:name)
+    end
+
+    def test_views
+      assert_equal [Paperback.table_name], @connection.views
+    end
+
+    def test_view_exists
+      view_name = Paperback.table_name
+      assert @connection.view_exists?(view_name), "'#{view_name}' view should exist"
+    end
+
+    def test_table_exists
+      view_name = Paperback.table_name
+      # TODO: switch this assertion around once we changed #tables to not return views.
+      ActiveSupport::Deprecation.silence { assert @connection.table_exists?(view_name), "'#{view_name}' table should exist" }
+    end
+
+    def test_column_definitions
+      assert_equal([["name", :string],
+                    ["status", :integer]], Paperback.columns.map { |c| [c.name, c.type] })
+    end
+
+    def test_attributes
+      assert_equal({"name" => "Agile Web Development with Rails", "status" => 2},
+                   Paperback.first.attributes)
+    end
+
+    def test_does_not_have_a_primary_key
+      assert_nil Paperback.primary_key
+    end
+
+    def test_does_not_dump_view_as_table
+      schema = dump_table_schema "paperbacks"
+      assert_no_match %r{create_table "paperbacks"}, schema
+    end
+  end
+
+# sqlite dose not support CREATE, INSERT, and DELETE for VIEW
+  if current_adapter?(:Mysql2Adapter, :PostgreSQLAdapter)
+    class UpdateableViewTest < ActiveRecord::TestCase
+      self.use_transactional_tests = false
+      fixtures :books
+
+      class PrintedBook < ActiveRecord::Base
+        self.primary_key = "id"
+      end
+
+      setup do
+        @connection = ActiveRecord::Base.connection
+        @connection.execute <<-SQL
+      CREATE VIEW printed_books
+        AS SELECT id, name, status, format FROM books WHERE format = 'paperback'
+    SQL
+      end
+
+      teardown do
+        @connection.execute "DROP VIEW printed_books" if @connection.view_exists? "printed_books"
+      end
+
+      def test_update_record
+        book = PrintedBook.first
+        book.name = "AWDwR"
+        book.save!
+        book.reload
+        assert_equal "AWDwR", book.name
+      end
+
+      def test_insert_record
+        PrintedBook.create! name: "Rails in Action", status: 0, format: "paperback"
+
+        new_book = PrintedBook.last
+        assert_equal "Rails in Action", new_book.name
+      end
+
+      def test_update_record_to_fail_view_conditions
+        book = PrintedBook.first
+        book.format = "ebook"
+        book.save!
+
+        assert_raises ActiveRecord::RecordNotFound do
+          book.reload
+        end
+      end
+    end
+  end # end fo `if current_adapter?(:Mysql2Adapter, :PostgreSQLAdapter)`
+end # end fo `if ActiveRecord::Base.connection.supports_views?`
+
+if ActiveRecord::Base.connection.respond_to?(:supports_materialized_views?) &&
+    ActiveRecord::Base.connection.supports_materialized_views?
+  class MaterializedViewTest < ActiveRecord::PostgreSQLTestCase
+    include ViewBehavior
+
+    private
+      def create_view(name, query)
+        @connection.execute "CREATE MATERIALIZED VIEW #{name} AS #{query}"
+      end
+
+      def drop_view(name)
+        @connection.execute "DROP MATERIALIZED VIEW #{name}" if @connection.view_exists? name
+      end
+  end
+end
+class Visitor
+  extend ActiveModel::Callbacks
+  include ActiveModel::SecurePassword
+
+  define_model_callbacks :create
+
+  has_secure_password(validations: false)
+
+  attr_accessor :password_digest, :password_confirmation
+end
+module ActionDispatch
+  module Journey # :nodoc:
+    class Format
+      ESCAPE_PATH    = ->(value) { Router::Utils.escape_path(value) }
+      ESCAPE_SEGMENT = ->(value) { Router::Utils.escape_segment(value) }
+
+      class Parameter < Struct.new(:name, :escaper)
+        def escape(value); escaper.call value; end
+      end
+
+      def self.required_path(symbol)
+        Parameter.new symbol, ESCAPE_PATH
+      end
+
+      def self.required_segment(symbol)
+        Parameter.new symbol, ESCAPE_SEGMENT
+      end
+
+      def initialize(parts)
+        @parts      = parts
+        @children   = []
+        @parameters = []
+
+        parts.each_with_index do |object,i|
+          case object
+          when Journey::Format
+            @children << i
+          when Parameter
+            @parameters << i
+          end
+        end
+      end
+
+      def evaluate(hash)
+        parts = @parts.dup
+
+        @parameters.each do |index|
+          param = parts[index]
+          value = hash[param.name]
+          return "".freeze unless value
+          parts[index] = param.escape value
+        end
+
+        @children.each { |index| parts[index] = parts[index].evaluate(hash) }
+
+        parts.join
+      end
+    end
+
+    module Visitors # :nodoc:
+      class Visitor # :nodoc:
+        DISPATCH_CACHE = {}
+
+        def accept(node)
+          visit(node)
+        end
+
+        private
+
+          def visit(node)
+            send(DISPATCH_CACHE[node.type], node)
+          end
+
+          def binary(node)
+            visit(node.left)
+            visit(node.right)
+          end
+          def visit_CAT(n); binary(n); end
+
+          def nary(node)
+            node.children.each { |c| visit(c) }
+          end
+          def visit_OR(n); nary(n); end
+
+          def unary(node)
+            visit(node.left)
+          end
+          def visit_GROUP(n); unary(n); end
+          def visit_STAR(n); unary(n); end
+
+          def terminal(node); end
+          def visit_LITERAL(n); terminal(n); end
+          def visit_SYMBOL(n);  terminal(n); end
+          def visit_SLASH(n);   terminal(n); end
+          def visit_DOT(n);     terminal(n); end
+
+          private_instance_methods(false).each do |pim|
+            next unless pim =~ /^visit_(.*)$/
+            DISPATCH_CACHE[$1.to_sym] = pim
+          end
+      end
+
+      class FunctionalVisitor # :nodoc:
+        DISPATCH_CACHE = {}
+
+        def accept(node, seed)
+          visit(node, seed)
+        end
+
+        def visit(node, seed)
+          send(DISPATCH_CACHE[node.type], node, seed)
+        end
+
+        def binary(node, seed)
+          visit(node.right, visit(node.left, seed))
+        end
+        def visit_CAT(n, seed); binary(n, seed); end
+
+        def nary(node, seed)
+          node.children.inject(seed) { |s, c| visit(c, s) }
+        end
+        def visit_OR(n, seed); nary(n, seed); end
+
+        def unary(node, seed)
+          visit(node.left, seed)
+        end
+        def visit_GROUP(n, seed); unary(n, seed); end
+        def visit_STAR(n, seed); unary(n, seed); end
+
+        def terminal(node, seed);   seed; end
+        def visit_LITERAL(n, seed); terminal(n, seed); end
+        def visit_SYMBOL(n, seed);  terminal(n, seed); end
+        def visit_SLASH(n, seed);   terminal(n, seed); end
+        def visit_DOT(n, seed);     terminal(n, seed); end
+
+        instance_methods(false).each do |pim|
+          next unless pim =~ /^visit_(.*)$/
+          DISPATCH_CACHE[$1.to_sym] = pim
+        end
+      end
+
+      class FormatBuilder < Visitor # :nodoc:
+        def accept(node); Journey::Format.new(super); end
+        def terminal(node); [node.left]; end
+
+        def binary(node)
+          visit(node.left) + visit(node.right)
+        end
+
+        def visit_GROUP(n); [Journey::Format.new(unary(n))]; end
+
+        def visit_STAR(n)
+          [Journey::Format.required_path(n.left.to_sym)]
+        end
+
+        def visit_SYMBOL(n)
+          symbol = n.to_sym
+          if symbol == :controller
+            [Journey::Format.required_path(symbol)]
+          else
+            [Journey::Format.required_segment(symbol)]
+          end
+        end
+      end
+
+      # Loop through the requirements AST
+      class Each < FunctionalVisitor # :nodoc:
+        def visit(node, block)
+          block.call(node)
+          super
+        end
+
+        INSTANCE = new
+      end
+
+      class String < FunctionalVisitor # :nodoc:
+        private
+
+          def binary(node, seed)
+            visit(node.right, visit(node.left, seed))
+          end
+
+          def nary(node, seed)
+            last_child = node.children.last
+            node.children.inject(seed) { |s, c|
+              string = visit(c, s)
+              string << "|".freeze unless last_child == c
+              string
+            }
+          end
+
+          def terminal(node, seed)
+            seed + node.left
+          end
+
+          def visit_GROUP(node, seed)
+            visit(node.left, seed << "(".freeze) << ")".freeze
+          end
+
+          INSTANCE = new
+      end
+
+      class Dot < FunctionalVisitor # :nodoc:
+        def initialize
+          @nodes = []
+          @edges = []
+        end
+
+        def accept(node, seed = [[], []])
+          super
+          nodes, edges = seed
+          <<-eodot
+  digraph parse_tree {
+    size="8,5"
+    node [shape = none];
+    edge [dir = none];
+    #{nodes.join "\n"}
+    #{edges.join("\n")}
+  }
+          eodot
+        end
+
+        private
+
+          def binary(node, seed)
+            seed.last.concat node.children.map { |c|
+              "#{node.object_id} -> #{c.object_id};"
+            }
+            super
+          end
+
+          def nary(node, seed)
+            seed.last.concat node.children.map { |c|
+              "#{node.object_id} -> #{c.object_id};"
+            }
+            super
+          end
+
+          def unary(node, seed)
+            seed.last << "#{node.object_id} -> #{node.left.object_id};"
+            super
+          end
+
+          def visit_GROUP(node, seed)
+            seed.first << "#{node.object_id} [label=\"()\"];"
+            super
+          end
+
+          def visit_CAT(node, seed)
+            seed.first << "#{node.object_id} [label=\"○\"];"
+            super
+          end
+
+          def visit_STAR(node, seed)
+            seed.first << "#{node.object_id} [label=\"*\"];"
+            super
+          end
+
+          def visit_OR(node, seed)
+            seed.first << "#{node.object_id} [label=\"|\"];"
+            super
+          end
+
+          def terminal(node, seed)
+            value = node.left
+
+            seed.first << "#{node.object_id} [label=\"#{value}\"];"
+            seed
+          end
+          INSTANCE = new
+      end
+    end
+  end
+end
+# ---------------------------------------------------------------------------
+#
+# This script validates the generated guides against the W3C Validator.
+#
+# Guides are taken from the output directory, from where all .html files are
+# submitted to the validator.
+#
+# This script is prepared to be launched from the guides directory as a rake task:
+#
+# rake guides:validate
+#
+# If nothing is specified, all files will be validated, but you can check just
+# some of them using this environment variable:
+#
+#   ONLY
+#     Use ONLY if you want to validate only one or a set of guides. Prefixes are
+#     enough:
+#
+#       # validates only association_basics.html
+#       rake guides:validate ONLY=assoc
+#
+#     Separate many using commas:
+#
+#       # validates only association_basics.html and command_line.html
+#       rake guides:validate ONLY=assoc,command
+#
+# ---------------------------------------------------------------------------
+
+require "w3c_validators"
+include W3CValidators
+
+module RailsGuides
+  class Validator
+    def validate
+      validator = MarkupValidator.new
+      STDOUT.sync = true
+      errors_on_guides = {}
+
+      guides_to_validate.each do |f|
+        begin
+          results = validator.validate_file(f)
+        rescue Exception => e
+          puts "\nCould not validate #{f} because of #{e}"
+          next
+        end
+
+        if results.validity
+          print "."
+        else
+          print "E"
+          errors_on_guides[f] = results.errors
+        end
+      end
+
+      show_results(errors_on_guides)
+    end
+
+    private
+      def guides_to_validate
+        guides = Dir["./output/*.html"]
+        guides.delete("./output/layout.html")
+        guides.delete("./output/_license.html")
+        guides.delete("./output/_welcome.html")
+        ENV.key?("ONLY") ? select_only(guides) : guides
+      end
+
+      def select_only(guides)
+        prefixes = ENV["ONLY"].split(",").map(&:strip)
+        guides.select do |guide|
+          prefixes.any? {|p| guide.start_with?("./output/#{p}")}
+        end
+      end
+
+      def show_results(error_list)
+        if error_list.size == 0
+          puts "\n\nAll checked guides validate OK!"
+        else
+          error_summary = error_detail = ""
+
+          error_list.each_pair do |name, errors|
+            error_summary += "\n  #{name}"
+            error_detail += "\n\n  #{name} has #{errors.size} validation error(s):\n"
+            errors.each do |error|
+              error_detail += "\n    "+error.to_s.delete("\n")
+            end
+          end
+
+          puts "\n\nThere are #{error_list.size} guides with validation errors:\n" + error_summary
+          puts "\nHere are the detailed errors for each guide:" + error_detail
+        end
+      end
+  end
+end
+
+RailsGuides::Validator.new.validate
+class WarehouseThing < ActiveRecord::Base
+  self.table_name = "warehouse-things"
+
+  validates_uniqueness_of :value
+end
+require "abstract_unit"
+require "active_support/json/decoding"
+
+class WebServiceTest < ActionDispatch::IntegrationTest
+  class TestController < ActionController::Base
+    def assign_parameters
+      if params[:full]
+        render plain: dump_params_keys
+      else
+        render plain: (params.keys - ["controller", "action"]).sort.join(", ")
+      end
+    end
+
+    def dump_params_keys(hash = params)
+      hash.keys.sort.inject("") do |s, k|
+        value = hash[k]
+
+        if value.is_a?(Hash) || value.is_a?(ActionController::Parameters)
+          value = "(#{dump_params_keys(value)})"
+        else
+          value = ""
+        end
+
+        s << ", " unless s.empty?
+        s << "#{k}#{value}"
+      end
+    end
+  end
+
+  def setup
+    @controller = TestController.new
+    @integration_session = nil
+  end
+
+  def test_check_parameters
+    with_test_route_set do
+      get "/"
+      assert_equal "", @controller.response.body
+    end
+  end
+
+  def test_post_json
+    with_test_route_set do
+      post "/",
+        params: '{"entry":{"summary":"content..."}}',
+        headers: { "CONTENT_TYPE" => "application/json" }
+
+      assert_equal "entry", @controller.response.body
+      assert @controller.params.has_key?(:entry)
+      assert_equal "content...", @controller.params["entry"]["summary"]
+    end
+  end
+
+  def test_put_json
+    with_test_route_set do
+      put "/",
+        params: '{"entry":{"summary":"content..."}}',
+        headers: { "CONTENT_TYPE" => "application/json" }
+
+      assert_equal "entry", @controller.response.body
+      assert @controller.params.has_key?(:entry)
+      assert_equal "content...", @controller.params["entry"]["summary"]
+    end
+  end
+
+  def test_register_and_use_json_simple
+    with_test_route_set do
+      with_params_parsers Mime[:json] => Proc.new { |data| ActiveSupport::JSON.decode(data)["request"].with_indifferent_access } do
+        post "/",
+          params: '{"request":{"summary":"content...","title":"JSON"}}',
+          headers: { "CONTENT_TYPE" => "application/json" }
+
+        assert_equal "summary, title", @controller.response.body
+        assert @controller.params.has_key?(:summary)
+        assert @controller.params.has_key?(:title)
+        assert_equal "content...", @controller.params["summary"]
+        assert_equal "JSON", @controller.params["title"]
+      end
+    end
+  end
+
+  def test_use_json_with_empty_request
+    with_test_route_set do
+      assert_nothing_raised { post "/", headers: { "CONTENT_TYPE" => "application/json" } }
+      assert_equal "", @controller.response.body
+    end
+  end
+
+  def test_dasherized_keys_as_json
+    with_test_route_set do
+      post "/?full=1",
+        params: '{"first-key":{"sub-key":"..."}}',
+        headers: { "CONTENT_TYPE" => "application/json" }
+      assert_equal "action, controller, first-key(sub-key), full", @controller.response.body
+      assert_equal "...", @controller.params["first-key"]["sub-key"]
+    end
+  end
+
+  def test_parsing_json_doesnot_rescue_exception
+    req = Class.new(ActionDispatch::Request) do
+      def params_parsers
+        { json: Proc.new { |data| raise Interrupt } }
+      end
+
+      def content_length; get_header("rack.input").length; end
+    end.new("rack.input" => StringIO.new('{"title":"JSON"}}'), "CONTENT_TYPE" => "application/json")
+
+    assert_raises(Interrupt) do
+      req.request_parameters
+    end
+  end
+
+  private
+    def with_params_parsers(parsers = {})
+      old_session = @integration_session
+      original_parsers = ActionDispatch::Request.parameter_parsers
+      ActionDispatch::Request.parameter_parsers = original_parsers.merge parsers
+      reset!
+      yield
+    ensure
+      ActionDispatch::Request.parameter_parsers = original_parsers
+      @integration_session = old_session
+    end
+
+    def with_test_route_set
+      with_routing do |set|
+        set.draw do
+          match "/", to: "web_service_test/test#assign_parameters", via: :all
+        end
+        yield
+      end
+    end
+end
+require "websocket/driver"
+
+module ActionCable
+  module Connection
+    # Wrap the real socket to minimize the externally-presented API
+    class WebSocket
+      def initialize(env, event_target, event_loop, client_socket_class, protocols: ActionCable::INTERNAL[:protocols])
+        @websocket = ::WebSocket::Driver.websocket?(env) ? client_socket_class.new(env, event_target, event_loop, protocols) : nil
+      end
+
+      def possible?
+        websocket
+      end
+
+      def alive?
+        websocket && websocket.alive?
+      end
+
+      def transmit(data)
+        websocket.transmit data
+      end
+
+      def close
+        websocket.close
+      end
+
+      def protocol
+        websocket.protocol
+      end
+
+      def rack_response
+        websocket.rack_response
+      end
+
+      protected
+        attr_reader :websocket
+    end
+  end
+end
+module ActionView
+  module Helpers
+    module Tags # :nodoc:
+      class WeekField < DatetimeField # :nodoc:
+        private
+
+          def format_date(value)
+            value.try(:strftime, "%Y-W%V")
+          end
+      end
+    end
+  end
+end
+require "rails/application_controller"
+
+class Rails::WelcomeController < Rails::ApplicationController # :nodoc:
+  layout false
+
+  def index
+  end
+end
+class Wheel < ActiveRecord::Base
+  belongs_to :wheelable, polymorphic: true, counter_cache: true
+end
+require "cases/helper"
+require "models/post"
+require "models/comment"
+
+module ActiveRecord
+  class WhereChainTest < ActiveRecord::TestCase
+    fixtures :posts
+
+    def setup
+      super
+      @name = "title"
+    end
+
+    def test_not_inverts_where_clause
+      relation = Post.where.not(title: "hello")
+      expected_where_clause = Post.where(title: "hello").where_clause.invert
+
+      assert_equal expected_where_clause, relation.where_clause
+    end
+
+    def test_not_with_nil
+      assert_raise ArgumentError do
+        Post.where.not(nil)
+      end
+    end
+
+    def test_association_not_eq
+      expected = Arel::Nodes::Grouping.new(Comment.arel_table[@name].not_eq(Arel::Nodes::BindParam.new))
+      relation = Post.joins(:comments).where.not(comments: {title: "hello"})
+      assert_equal(expected.to_sql, relation.where_clause.ast.to_sql)
+    end
+
+    def test_not_eq_with_preceding_where
+      relation = Post.where(title: "hello").where.not(title: "world")
+      expected_where_clause =
+        Post.where(title: "hello").where_clause +
+        Post.where(title: "world").where_clause.invert
+
+      assert_equal expected_where_clause, relation.where_clause
+    end
+
+    def test_not_eq_with_succeeding_where
+      relation = Post.where.not(title: "hello").where(title: "world")
+      expected_where_clause =
+        Post.where(title: "hello").where_clause.invert +
+        Post.where(title: "world").where_clause
+
+      assert_equal expected_where_clause, relation.where_clause
+    end
+
+    def test_chaining_multiple
+      relation = Post.where.not(author_id: [1, 2]).where.not(title: "ruby on rails")
+      expected_where_clause =
+        Post.where(author_id: [1, 2]).where_clause.invert +
+        Post.where(title: "ruby on rails").where_clause.invert
+
+      assert_equal expected_where_clause, relation.where_clause
+    end
+
+    def test_rewhere_with_one_condition
+      relation = Post.where(title: "hello").where(title: "world").rewhere(title: "alone")
+      expected = Post.where(title: "alone")
+
+      assert_equal expected.where_clause, relation.where_clause
+    end
+
+    def test_rewhere_with_multiple_overwriting_conditions
+      relation = Post.where(title: "hello").where(body: "world").rewhere(title: "alone", body: "again")
+      expected = Post.where(title: "alone", body: "again")
+
+      assert_equal expected.where_clause, relation.where_clause
+    end
+
+    def test_rewhere_with_one_overwriting_condition_and_one_unrelated
+      relation = Post.where(title: "hello").where(body: "world").rewhere(title: "alone")
+      expected = Post.where(body: "world", title: "alone")
+
+      assert_equal expected.where_clause, relation.where_clause
+    end
+
+    def test_rewhere_with_range
+      relation = Post.where(comments_count: 1..3).rewhere(comments_count: 3..5)
+
+      assert_equal Post.where(comments_count: 3..5), relation
+    end
+
+    def test_rewhere_with_infinite_upper_bound_range
+      relation = Post.where(comments_count: 1..Float::INFINITY).rewhere(comments_count: 3..5)
+
+      assert_equal Post.where(comments_count: 3..5), relation
+    end
+
+    def test_rewhere_with_infinite_lower_bound_range
+      relation = Post.where(comments_count: -Float::INFINITY..1).rewhere(comments_count: 3..5)
+
+      assert_equal Post.where(comments_count: 3..5), relation
+    end
+
+    def test_rewhere_with_infinite_range
+      relation = Post.where(comments_count: -Float::INFINITY..Float::INFINITY).rewhere(comments_count: 3..5)
+
+      assert_equal Post.where(comments_count: 3..5), relation
+    end
+  end
+end
+module ActiveRecord
+  class Relation
+    class WhereClauseFactory # :nodoc:
+      def initialize(klass, predicate_builder)
+        @klass = klass
+        @predicate_builder = predicate_builder
+      end
+
+      def build(opts, other)
+        binds = []
+
+        case opts
+        when String, Array
+          parts = [klass.send(:sanitize_sql, other.empty? ? opts : ([opts] + other))]
+        when Hash
+          attributes = predicate_builder.resolve_column_aliases(opts)
+          attributes = klass.send(:expand_hash_conditions_for_aggregates, attributes)
+          attributes.stringify_keys!
+
+          attributes, binds = predicate_builder.create_binds(attributes)
+
+          parts = predicate_builder.build_from_hash(attributes)
+        when Arel::Nodes::Node
+          parts = [opts]
+        else
+          raise ArgumentError, "Unsupported argument type: #{opts} (#{opts.class})"
+        end
+
+        WhereClause.new(parts, binds)
+      end
+
+      protected
+
+        attr_reader :klass, :predicate_builder
+    end
+  end
+end
+module ActiveRecord
+  class Relation
+    class WhereClause # :nodoc:
+      attr_reader :binds
+
+      delegate :any?, :empty?, to: :predicates
+
+      def initialize(predicates, binds)
+        @predicates = predicates
+        @binds = binds
+      end
+
+      def +(other)
+        WhereClause.new(
+          predicates + other.predicates,
+          binds + other.binds,
+        )
+      end
+
+      def merge(other)
+        WhereClause.new(
+          predicates_unreferenced_by(other) + other.predicates,
+          non_conflicting_binds(other) + other.binds,
+        )
+      end
+
+      def except(*columns)
+        WhereClause.new(
+          predicates_except(columns),
+          binds_except(columns),
+        )
+      end
+
+      def or(other)
+        if empty?
+          self
+        elsif other.empty?
+          other
+        else
+          WhereClause.new(
+            [ast.or(other.ast)],
+            binds + other.binds
+          )
+        end
+      end
+
+      def to_h(table_name = nil)
+        equalities = predicates.grep(Arel::Nodes::Equality)
+        if table_name
+          equalities = equalities.select do |node|
+            node.left.relation.name == table_name
+          end
+        end
+
+        binds = self.binds.map { |attr| [attr.name, attr.value] }.to_h
+
+        equalities.map { |node|
+          name = node.left.name
+          [name, binds.fetch(name.to_s) {
+            case node.right
+            when Array then node.right.map(&:val)
+            when Arel::Nodes::Casted, Arel::Nodes::Quoted
+              node.right.val
+            end
+          }]
+        }.to_h
+      end
+
+      def ast
+        Arel::Nodes::And.new(predicates_with_wrapped_sql_literals)
+      end
+
+      def ==(other)
+        other.is_a?(WhereClause) &&
+          predicates == other.predicates &&
+          binds == other.binds
+      end
+
+      def invert
+        WhereClause.new(inverted_predicates, binds)
+      end
+
+      def self.empty
+        @empty ||= new([], [])
+      end
+
+      protected
+
+        attr_reader :predicates
+
+        def referenced_columns
+          @referenced_columns ||= begin
+            equality_nodes = predicates.select { |n| equality_node?(n) }
+            Set.new(equality_nodes, &:left)
+          end
+        end
+
+      private
+
+        def predicates_unreferenced_by(other)
+          predicates.reject do |n|
+            equality_node?(n) && other.referenced_columns.include?(n.left)
+          end
+        end
+
+        def equality_node?(node)
+          node.respond_to?(:operator) && node.operator == :==
+        end
+
+        def non_conflicting_binds(other)
+          conflicts = referenced_columns & other.referenced_columns
+          conflicts.map! { |node| node.name.to_s }
+          binds.reject { |attr| conflicts.include?(attr.name) }
+        end
+
+        def inverted_predicates
+          predicates.map { |node| invert_predicate(node) }
+        end
+
+        def invert_predicate(node)
+          case node
+          when NilClass
+            raise ArgumentError, "Invalid argument for .where.not(), got nil."
+          when Arel::Nodes::In
+            Arel::Nodes::NotIn.new(node.left, node.right)
+          when Arel::Nodes::Equality
+            Arel::Nodes::NotEqual.new(node.left, node.right)
+          when String
+            Arel::Nodes::Not.new(Arel::Nodes::SqlLiteral.new(node))
+          else
+            Arel::Nodes::Not.new(node)
+          end
+        end
+
+        def predicates_except(columns)
+          predicates.reject do |node|
+            case node
+            when Arel::Nodes::Between, Arel::Nodes::In, Arel::Nodes::NotIn, Arel::Nodes::Equality, Arel::Nodes::NotEqual, Arel::Nodes::LessThan, Arel::Nodes::LessThanOrEqual, Arel::Nodes::GreaterThan, Arel::Nodes::GreaterThanOrEqual
+              subrelation = (node.left.kind_of?(Arel::Attributes::Attribute) ? node.left : node.right)
+              columns.include?(subrelation.name.to_s)
+            end
+          end
+        end
+
+        def binds_except(columns)
+          binds.reject do |attr|
+            columns.include?(attr.name)
+          end
+        end
+
+        def predicates_with_wrapped_sql_literals
+          non_empty_predicates.map do |node|
+            if Arel::Nodes::Equality === node
+              node
+            else
+              wrap_sql_literal(node)
+            end
+          end
+        end
+
+        ARRAY_WITH_EMPTY_STRING = [""]
+        def non_empty_predicates
+          predicates - ARRAY_WITH_EMPTY_STRING
+        end
+
+        def wrap_sql_literal(node)
+          if ::String === node
+            node = Arel.sql(node)
+          end
+          Arel::Nodes::Grouping.new(node)
+        end
+    end
+  end
+end
+require "cases/helper"
+
+class ActiveRecord::Relation
+  class WhereClauseTest < ActiveRecord::TestCase
+    test "+ combines two where clauses" do
+      first_clause = WhereClause.new([table["id"].eq(bind_param)], [["id", 1]])
+      second_clause = WhereClause.new([table["name"].eq(bind_param)], [["name", "Sean"]])
+      combined = WhereClause.new(
+        [table["id"].eq(bind_param), table["name"].eq(bind_param)],
+        [["id", 1], ["name", "Sean"]],
+      )
+
+      assert_equal combined, first_clause + second_clause
+    end
+
+    test "+ is associative, but not commutative" do
+      a = WhereClause.new(["a"], ["bind a"])
+      b = WhereClause.new(["b"], ["bind b"])
+      c = WhereClause.new(["c"], ["bind c"])
+
+      assert_equal a + (b + c), (a + b) + c
+      assert_not_equal a + b, b + a
+    end
+
+    test "an empty where clause is the identity value for +" do
+      clause = WhereClause.new([table["id"].eq(bind_param)], [["id", 1]])
+
+      assert_equal clause, clause + WhereClause.empty
+    end
+
+    test "merge combines two where clauses" do
+      a = WhereClause.new([table["id"].eq(1)], [])
+      b = WhereClause.new([table["name"].eq("Sean")], [])
+      expected = WhereClause.new([table["id"].eq(1), table["name"].eq("Sean")], [])
+
+      assert_equal expected, a.merge(b)
+    end
+
+    test "merge keeps the right side, when two equality clauses reference the same column" do
+      a = WhereClause.new([table["id"].eq(1), table["name"].eq("Sean")], [])
+      b = WhereClause.new([table["name"].eq("Jim")], [])
+      expected = WhereClause.new([table["id"].eq(1), table["name"].eq("Jim")], [])
+
+      assert_equal expected, a.merge(b)
+    end
+
+    test "merge removes bind parameters matching overlapping equality clauses" do
+      a = WhereClause.new(
+        [table["id"].eq(bind_param), table["name"].eq(bind_param)],
+        [attribute("id", 1), attribute("name", "Sean")],
+      )
+      b = WhereClause.new(
+        [table["name"].eq(bind_param)],
+        [attribute("name", "Jim")]
+      )
+      expected = WhereClause.new(
+        [table["id"].eq(bind_param), table["name"].eq(bind_param)],
+        [attribute("id", 1), attribute("name", "Jim")],
+      )
+
+      assert_equal expected, a.merge(b)
+    end
+
+    test "merge allows for columns with the same name from different tables" do
+      skip "This is not possible as of 4.2, and the binds do not yet contain sufficient information for this to happen"
+      # We might be able to change the implementation to remove conflicts by index, rather than column name
+    end
+
+    test "a clause knows if it is empty" do
+      assert WhereClause.empty.empty?
+      assert_not WhereClause.new(["anything"], []).empty?
+    end
+
+    test "invert cannot handle nil" do
+      where_clause = WhereClause.new([nil], [])
+
+      assert_raises ArgumentError do
+        where_clause.invert
+      end
+    end
+
+    test "invert replaces each part of the predicate with its inverse" do
+      random_object = Object.new
+      original = WhereClause.new([
+        table["id"].in([1, 2, 3]),
+        table["id"].eq(1),
+        "sql literal",
+        random_object
+      ], [])
+      expected = WhereClause.new([
+        table["id"].not_in([1, 2, 3]),
+        table["id"].not_eq(1),
+        Arel::Nodes::Not.new(Arel::Nodes::SqlLiteral.new("sql literal")),
+        Arel::Nodes::Not.new(random_object)
+      ], [])
+
+      assert_equal expected, original.invert
+    end
+
+    test "accept removes binary predicates referencing a given column" do
+      where_clause = WhereClause.new([
+        table["id"].in([1, 2, 3]),
+        table["name"].eq(bind_param),
+        table["age"].gteq(bind_param),
+      ], [
+        attribute("name", "Sean"),
+        attribute("age", 30),
+      ])
+      expected = WhereClause.new([table["age"].gteq(bind_param)], [attribute("age", 30)])
+
+      assert_equal expected, where_clause.except("id", "name")
+    end
+
+    test "ast groups its predicates with AND" do
+      predicates = [
+        table["id"].in([1, 2, 3]),
+        table["name"].eq(bind_param),
+      ]
+      where_clause = WhereClause.new(predicates, [])
+      expected = Arel::Nodes::And.new(predicates)
+
+      assert_equal expected, where_clause.ast
+    end
+
+    test "ast wraps any SQL literals in parenthesis" do
+      random_object = Object.new
+      where_clause = WhereClause.new([
+        table["id"].in([1, 2, 3]),
+        "foo = bar",
+        random_object,
+      ], [])
+      expected = Arel::Nodes::And.new([
+        table["id"].in([1, 2, 3]),
+        Arel::Nodes::Grouping.new(Arel.sql("foo = bar")),
+        Arel::Nodes::Grouping.new(random_object),
+      ])
+
+      assert_equal expected, where_clause.ast
+    end
+
+    test "ast removes any empty strings" do
+      where_clause = WhereClause.new([table["id"].in([1, 2, 3])], [])
+      where_clause_with_empty = WhereClause.new([table["id"].in([1, 2, 3]), ""], [])
+
+      assert_equal where_clause.ast, where_clause_with_empty.ast
+    end
+
+    test "or joins the two clauses using OR" do
+      where_clause = WhereClause.new([table["id"].eq(bind_param)], [attribute("id", 1)])
+      other_clause = WhereClause.new([table["name"].eq(bind_param)], [attribute("name", "Sean")])
+      expected_ast =
+        Arel::Nodes::Grouping.new(
+          Arel::Nodes::Or.new(table["id"].eq(bind_param), table["name"].eq(bind_param))
+        )
+      expected_binds = where_clause.binds + other_clause.binds
+
+      assert_equal expected_ast.to_sql, where_clause.or(other_clause).ast.to_sql
+      assert_equal expected_binds, where_clause.or(other_clause).binds
+    end
+
+    test "or returns an empty where clause when either side is empty" do
+      where_clause = WhereClause.new([table["id"].eq(bind_param)], [attribute("id", 1)])
+
+      assert_equal WhereClause.empty, where_clause.or(WhereClause.empty)
+      assert_equal WhereClause.empty, WhereClause.empty.or(where_clause)
+    end
+
+    private
+
+      def table
+        Arel::Table.new("table")
+      end
+
+      def bind_param
+        Arel::Nodes::BindParam.new
+      end
+
+      def attribute(name, value)
+        ActiveRecord::Attribute.with_cast_value(name, value, ActiveRecord::Type::Value.new)
+      end
+  end
+end
+require "cases/helper"
+require "models/author"
+require "models/binary"
+require "models/cake_designer"
+require "models/car"
+require "models/chef"
+require "models/comment"
+require "models/edge"
+require "models/essay"
+require "models/post"
+require "models/price_estimate"
+require "models/topic"
+require "models/treasure"
+require "models/vertex"
+
+module ActiveRecord
+  class WhereTest < ActiveRecord::TestCase
+    fixtures :posts, :edges, :authors, :binaries, :essays, :cars, :treasures, :price_estimates
+
+    def test_where_copies_bind_params
+      author = authors(:david)
+      posts  = author.posts.where("posts.id != 1")
+      joined = Post.where(id: posts)
+
+      assert_operator joined.length, :>, 0
+
+      joined.each { |post|
+        assert_equal author, post.author
+        assert_not_equal 1, post.id
+      }
+    end
+
+    def test_where_copies_bind_params_in_the_right_order
+      author = authors(:david)
+      posts = author.posts.where.not(id: 1)
+      joined = Post.where(id: posts, title: posts.first.title)
+
+      assert_equal joined, [posts.first]
+    end
+
+    def test_where_copies_arel_bind_params
+      chef = Chef.create!
+      CakeDesigner.create!(chef: chef)
+
+      cake_designers = CakeDesigner.joins(:chef).where(chefs: { id: chef.id })
+      chefs = Chef.where(employable: cake_designers)
+
+      assert_equal [chef], chefs.to_a
+    end
+
+    def test_rewhere_on_root
+      assert_equal posts(:welcome), Post.rewhere(title: "Welcome to the weblog").first
+    end
+
+    def test_belongs_to_shallow_where
+      author = Author.new
+      author.id = 1
+
+      assert_equal Post.where(author_id: 1).to_sql, Post.where(author: author).to_sql
+    end
+
+    def test_belongs_to_nil_where
+      assert_equal Post.where(author_id: nil).to_sql, Post.where(author: nil).to_sql
+    end
+
+    def test_belongs_to_array_value_where
+      assert_equal Post.where(author_id: [1,2]).to_sql, Post.where(author: [1,2]).to_sql
+    end
+
+    def test_belongs_to_nested_relation_where
+      expected = Post.where(author_id: Author.where(id: [1,2])).to_sql
+      actual   = Post.where(author:    Author.where(id: [1,2])).to_sql
+
+      assert_equal expected, actual
+    end
+
+    def test_belongs_to_nested_where
+      parent = Comment.new
+      parent.id = 1
+
+      expected = Post.where(comments: { parent_id: 1 }).joins(:comments)
+      actual   = Post.where(comments: { parent: parent }).joins(:comments)
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_belongs_to_nested_where_with_relation
+      author = authors(:david)
+
+      expected = Author.where(id: author ).joins(:posts)
+      actual   = Author.where(posts: { author_id: Author.where(id: author.id) }).joins(:posts)
+
+      assert_equal expected.to_a, actual.to_a
+    end
+
+    def test_polymorphic_shallow_where
+      treasure = Treasure.new
+      treasure.id = 1
+
+      expected = PriceEstimate.where(estimate_of_type: "Treasure", estimate_of_id: 1)
+      actual   = PriceEstimate.where(estimate_of: treasure)
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_polymorphic_nested_array_where
+      treasure = Treasure.new
+      treasure.id = 1
+      hidden = HiddenTreasure.new
+      hidden.id = 2
+
+      expected = PriceEstimate.where(estimate_of_type: "Treasure", estimate_of_id: [treasure, hidden])
+      actual   = PriceEstimate.where(estimate_of: [treasure, hidden])
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_polymorphic_array_where_multiple_types
+      treasure_1 = treasures(:diamond)
+      treasure_2 = treasures(:sapphire)
+      car = cars(:honda)
+
+      expected = [price_estimates(:diamond), price_estimates(:sapphire_1), price_estimates(:sapphire_2), price_estimates(:honda)].sort
+      actual   = PriceEstimate.where(estimate_of: [treasure_1, treasure_2, car]).to_a.sort
+
+      assert_equal expected, actual
+    end
+
+    def test_polymorphic_nested_relation_where
+      expected = PriceEstimate.where(estimate_of_type: "Treasure", estimate_of_id: Treasure.where(id: [1,2]))
+      actual   = PriceEstimate.where(estimate_of: Treasure.where(id: [1,2]))
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_polymorphic_sti_shallow_where
+      treasure = HiddenTreasure.new
+      treasure.id = 1
+
+      expected = PriceEstimate.where(estimate_of_type: "Treasure", estimate_of_id: 1)
+      actual   = PriceEstimate.where(estimate_of: treasure)
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_polymorphic_nested_where
+      thing = Post.new
+      thing.id = 1
+
+      expected = Treasure.where(price_estimates: { thing_type: "Post", thing_id: 1 }).joins(:price_estimates)
+      actual   = Treasure.where(price_estimates: { thing: thing }).joins(:price_estimates)
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_polymorphic_sti_nested_where
+      treasure = HiddenTreasure.new
+      treasure.id = 1
+
+      expected = Treasure.where(price_estimates: { estimate_of_type: "Treasure", estimate_of_id: 1 }).joins(:price_estimates)
+      actual   = Treasure.where(price_estimates: { estimate_of: treasure }).joins(:price_estimates)
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_decorated_polymorphic_where
+      treasure_decorator = Struct.new(:model) do
+        def self.method_missing(method, *args, &block)
+          Treasure.send(method, *args, &block)
+        end
+
+        def is_a?(klass)
+          model.is_a?(klass)
+        end
+
+        def method_missing(method, *args, &block)
+          model.send(method, *args, &block)
+        end
+      end
+
+      treasure = Treasure.new
+      treasure.id = 1
+      decorated_treasure = treasure_decorator.new(treasure)
+
+      expected = PriceEstimate.where(estimate_of_type: "Treasure", estimate_of_id: 1)
+      actual   = PriceEstimate.where(estimate_of: decorated_treasure)
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_aliased_attribute
+      expected = Topic.where(heading: "The First Topic")
+      actual   = Topic.where(title: "The First Topic")
+
+      assert_equal expected.to_sql, actual.to_sql
+    end
+
+    def test_where_error
+      assert_raises(ActiveRecord::StatementInvalid) do
+        Post.where(id: { "posts.author_id" => 10 }).first
+      end
+    end
+
+    def test_where_with_table_name
+      post = Post.first
+      assert_equal post, Post.where(posts: { "id" => post.id }).first
+    end
+
+    def test_where_with_table_name_and_empty_hash
+      assert_equal 0, Post.where(posts: {}).count
+    end
+
+    def test_where_with_table_name_and_empty_array
+      assert_equal 0, Post.where(id: []).count
+    end
+
+    def test_where_with_empty_hash_and_no_foreign_key
+      assert_equal 0, Edge.where(sink: {}).count
+    end
+
+    def test_where_with_blank_conditions
+      [[], {}, nil, ""].each do |blank|
+        assert_equal 4, Edge.where(blank).order("sink_id").to_a.size
+      end
+    end
+
+    def test_where_with_integer_for_string_column
+      count = Post.where(title: 0).count
+      assert_equal 0, count
+    end
+
+    def test_where_with_float_for_string_column
+      count = Post.where(title: 0.0).count
+      assert_equal 0, count
+    end
+
+    def test_where_with_boolean_for_string_column
+      count = Post.where(title: false).count
+      assert_equal 0, count
+    end
+
+    def test_where_with_decimal_for_string_column
+      count = Post.where(title: BigDecimal.new(0)).count
+      assert_equal 0, count
+    end
+
+    def test_where_with_duration_for_string_column
+      count = Post.where(title: 0.seconds).count
+      assert_equal 0, count
+    end
+
+    def test_where_with_integer_for_binary_column
+      count = Binary.where(data: 0).count
+      assert_equal 0, count
+    end
+
+    def test_where_on_association_with_custom_primary_key
+      author = authors(:david)
+      essay = Essay.where(writer: author).first
+
+      assert_equal essays(:david_modest_proposal), essay
+    end
+
+    def test_where_on_association_with_custom_primary_key_with_relation
+      author = authors(:david)
+      essay = Essay.where(writer: Author.where(id: author.id)).first
+
+      assert_equal essays(:david_modest_proposal), essay
+    end
+
+    def test_where_on_association_with_relation_performs_subselect_not_two_queries
+      author = authors(:david)
+
+      assert_queries(1) do
+        Essay.where(writer: Author.where(id: author.id)).to_a
+      end
+    end
+
+    def test_where_on_association_with_custom_primary_key_with_array_of_base
+      author = authors(:david)
+      essay = Essay.where(writer: [author]).first
+
+      assert_equal essays(:david_modest_proposal), essay
+    end
+
+    def test_where_on_association_with_custom_primary_key_with_array_of_ids
+      essay = Essay.where(writer: ["David"]).first
+
+      assert_equal essays(:david_modest_proposal), essay
+    end
+
+    def test_where_with_strong_parameters
+      protected_params = Class.new do
+        attr_reader :permitted
+        alias :permitted? :permitted
+
+        def initialize(parameters)
+          @parameters = parameters
+          @permitted = false
+        end
+
+        def to_h
+          @parameters
+        end
+
+        def permit!
+          @permitted = true
+          self
+        end
+      end
+
+      author = authors(:david)
+      params = protected_params.new(name: author.name)
+      assert_raises(ActiveModel::ForbiddenAttributesError) { Author.where(params) }
+      assert_equal author, Author.where(params.permit!).first
+    end
+
+    def test_where_with_unsupported_arguments
+      assert_raises(ArgumentError) { Author.where(42) }
+    end
+  end
+end
+require "abstract_unit"
+
+class WithCookiesController < ActionController::API
+  include ActionController::Cookies
+
+  def with_cookies
+    render plain: cookies[:foobar]
+  end
+end
+
+class WithCookiesTest < ActionController::TestCase
+  tests WithCookiesController
+
+  def test_with_cookies
+    request.cookies[:foobar] = "bazbang"
+
+    get :with_cookies
+
+    assert_equal "bazbang", response.body
+  end
+end
+require "active_support/option_merger"
+
+class Object
+  # An elegant way to factor duplication out of options passed to a series of
+  # method calls. Each method called in the block, with the block variable as
+  # the receiver, will have its options merged with the default +options+ hash
+  # provided. Each method called on the block variable must take an options
+  # hash as its final argument.
+  #
+  # Without <tt>with_options</tt>, this code contains duplication:
+  #
+  #   class Account < ActiveRecord::Base
+  #     has_many :customers, dependent: :destroy
+  #     has_many :products,  dependent: :destroy
+  #     has_many :invoices,  dependent: :destroy
+  #     has_many :expenses,  dependent: :destroy
+  #   end
+  #
+  # Using <tt>with_options</tt>, we can remove the duplication:
+  #
+  #   class Account < ActiveRecord::Base
+  #     with_options dependent: :destroy do |assoc|
+  #       assoc.has_many :customers
+  #       assoc.has_many :products
+  #       assoc.has_many :invoices
+  #       assoc.has_many :expenses
+  #     end
+  #   end
+  #
+  # It can also be used with an explicit receiver:
+  #
+  #   I18n.with_options locale: user.locale, scope: 'newsletter' do |i18n|
+  #     subject i18n.t :subject
+  #     body    i18n.t :body, user_name: user.name
+  #   end
+  #
+  # When you don't pass an explicit receiver, it executes the whole block
+  # in merging options context:
+  #
+  #   class Account < ActiveRecord::Base
+  #     with_options dependent: :destroy do
+  #       has_many :customers
+  #       has_many :products
+  #       has_many :invoices
+  #       has_many :expenses
+  #     end
+  #   end
+  #
+  # <tt>with_options</tt> can also be nested since the call is forwarded to its receiver.
+  #
+  # NOTE: Each nesting level will merge inherited defaults in addition to their own.
+  #
+  #   class Post < ActiveRecord::Base
+  #     with_options if: :persisted?, length: { minimum: 50 } do
+  #       validates :content, if: -> { content.present? }
+  #     end
+  #   end
+  #
+  # The code is equivalent to:
+  #
+  #   validates :content, length: { minimum: 50 }, if: -> { content.present? }
+  #
+  # Hence the inherited default for `if` key is ignored.
+  #
+  def with_options(options, &block)
+    option_merger = ActiveSupport::OptionMerger.new(self, options)
+    block.arity.zero? ? option_merger.instance_eval(&block) : block.call(option_merger)
+  end
+end
+class WithoutTable < ActiveRecord::Base
+  default_scope -> { where(published: true) }
+end
+module ActiveModel
+  module Validations
+    class WithValidator < EachValidator # :nodoc:
+      def validate_each(record, attr, val)
+        method_name = options[:with]
+
+        if record.method(method_name).arity == 0
+          record.send method_name
+        else
+          record.send method_name, attr
+        end
+      end
+    end
+
+    module ClassMethods
+      # Passes the record off to the class or classes specified and allows them
+      # to add errors based on more complex conditions.
+      #
+      #   class Person
+      #     include ActiveModel::Validations
+      #     validates_with MyValidator
+      #   end
+      #
+      #   class MyValidator < ActiveModel::Validator
+      #     def validate(record)
+      #       if some_complex_logic
+      #         record.errors.add :base, 'This record is invalid'
+      #       end
+      #     end
+      #
+      #     private
+      #       def some_complex_logic
+      #         # ...
+      #       end
+      #   end
+      #
+      # You may also pass it multiple classes, like so:
+      #
+      #   class Person
+      #     include ActiveModel::Validations
+      #     validates_with MyValidator, MyOtherValidator, on: :create
+      #   end
+      #
+      # Configuration options:
+      # * <tt>:on</tt> - Specifies the contexts where this validation is active.
+      #   Runs in all validation contexts by default (nil). You can pass a symbol
+      #   or an array of symbols. (e.g. <tt>on: :create</tt> or
+      #   <tt>on: :custom_validation_context</tt> or
+      #   <tt>on: [:create, :custom_validation_context]</tt>)
+      # * <tt>:if</tt> - Specifies a method, proc or string to call to determine
+      #   if the validation should occur (e.g. <tt>if: :allow_validation</tt>,
+      #   or <tt>if: Proc.new { |user| user.signup_step > 2 }</tt>).
+      #   The method, proc or string should return or evaluate to a +true+ or
+      #   +false+ value.
+      # * <tt>:unless</tt> - Specifies a method, proc or string to call to
+      #   determine if the validation should not occur
+      #   (e.g. <tt>unless: :skip_validation</tt>, or
+      #   <tt>unless: Proc.new { |user| user.signup_step <= 2 }</tt>).
+      #   The method, proc or string should return or evaluate to a +true+ or
+      #   +false+ value.
+      # * <tt>:strict</tt> - Specifies whether validation should be strict.
+      #   See <tt>ActiveModel::Validation#validates!</tt> for more information.
+      #
+      # If you pass any additional configuration options, they will be passed
+      # to the class and available as +options+:
+      #
+      #   class Person
+      #     include ActiveModel::Validations
+      #     validates_with MyValidator, my_custom_key: 'my custom value'
+      #   end
+      #
+      #   class MyValidator < ActiveModel::Validator
+      #     def validate(record)
+      #       options[:my_custom_key] # => "my custom value"
+      #     end
+      #   end
+      def validates_with(*args, &block)
+        options = args.extract_options!
+        options[:class] = self
+
+        args.each do |klass|
+          validator = klass.new(options, &block)
+
+          if validator.respond_to?(:attributes) && !validator.attributes.empty?
+            validator.attributes.each do |attribute|
+              _validators[attribute.to_sym] << validator
+            end
+          else
+            _validators[nil] << validator
+          end
+
+          validate(validator, options)
+        end
+      end
+    end
+
+    # Passes the record off to the class or classes specified and allows them
+    # to add errors based on more complex conditions.
+    #
+    #   class Person
+    #     include ActiveModel::Validations
+    #
+    #     validate :instance_validations
+    #
+    #     def instance_validations
+    #       validates_with MyValidator
+    #     end
+    #   end
+    #
+    # Please consult the class method documentation for more information on
+    # creating your own validator.
+    #
+    # You may also pass it multiple classes, like so:
+    #
+    #   class Person
+    #     include ActiveModel::Validations
+    #
+    #     validate :instance_validations, on: :create
+    #
+    #     def instance_validations
+    #       validates_with MyValidator, MyOtherValidator
+    #     end
+    #   end
+    #
+    # Standard configuration options (<tt>:on</tt>, <tt>:if</tt> and
+    # <tt>:unless</tt>), which are available on the class version of
+    # +validates_with+, should instead be placed on the +validates+ method
+    # as these are applied and tested in the callback.
+    #
+    # If you pass any additional configuration options, they will be passed
+    # to the class and available as +options+, please refer to the
+    # class version of this method for more information.
+    def validates_with(*args, &block)
+      options = args.extract_options!
+      options[:class] = self.class
+
+      args.each do |klass|
+        validator = klass.new(options, &block)
+        validator.validate(self)
+      end
+    end
+  end
+end
+require "cases/helper"
+
+require "models/topic"
+
+class ValidatesWithTest < ActiveModel::TestCase
+  def teardown
+    Topic.clear_validators!
+  end
+
+  ERROR_MESSAGE = "Validation error from validator"
+  OTHER_ERROR_MESSAGE = "Validation error from other validator"
+
+  class ValidatorThatAddsErrors < ActiveModel::Validator
+    def validate(record)
+      record.errors[:base] << ERROR_MESSAGE
+    end
+  end
+
+  class OtherValidatorThatAddsErrors < ActiveModel::Validator
+    def validate(record)
+      record.errors[:base] << OTHER_ERROR_MESSAGE
+    end
+  end
+
+  class ValidatorThatDoesNotAddErrors < ActiveModel::Validator
+    def validate(record)
+    end
+  end
+
+  class ValidatorThatValidatesOptions < ActiveModel::Validator
+    def validate(record)
+      if options[:field] == :first_name
+        record.errors[:base] << ERROR_MESSAGE
+      end
+    end
+  end
+
+  class ValidatorPerEachAttribute < ActiveModel::EachValidator
+    def validate_each(record, attribute, value)
+      record.errors[attribute] << "Value is #{value}"
+    end
+  end
+
+  class ValidatorCheckValidity < ActiveModel::EachValidator
+    def check_validity!
+      raise "boom!"
+    end
+  end
+
+  test "validation with class that adds errors" do
+    Topic.validates_with(ValidatorThatAddsErrors)
+    topic = Topic.new
+    assert topic.invalid?, "A class that adds errors causes the record to be invalid"
+    assert topic.errors[:base].include?(ERROR_MESSAGE)
+  end
+
+  test "with a class that returns valid" do
+    Topic.validates_with(ValidatorThatDoesNotAddErrors)
+    topic = Topic.new
+    assert topic.valid?, "A class that does not add errors does not cause the record to be invalid"
+  end
+
+  test "with multiple classes" do
+    Topic.validates_with(ValidatorThatAddsErrors, OtherValidatorThatAddsErrors)
+    topic = Topic.new
+    assert topic.invalid?
+    assert topic.errors[:base].include?(ERROR_MESSAGE)
+    assert topic.errors[:base].include?(OTHER_ERROR_MESSAGE)
+  end
+
+  test "with if statements that return false" do
+    Topic.validates_with(ValidatorThatAddsErrors, if: "1 == 2")
+    topic = Topic.new
+    assert topic.valid?
+  end
+
+  test "with if statements that return true" do
+    Topic.validates_with(ValidatorThatAddsErrors, if: "1 == 1")
+    topic = Topic.new
+    assert topic.invalid?
+    assert topic.errors[:base].include?(ERROR_MESSAGE)
+  end
+
+  test "with unless statements that return true" do
+    Topic.validates_with(ValidatorThatAddsErrors, unless: "1 == 1")
+    topic = Topic.new
+    assert topic.valid?
+  end
+
+  test "with unless statements that returns false" do
+    Topic.validates_with(ValidatorThatAddsErrors, unless: "1 == 2")
+    topic = Topic.new
+    assert topic.invalid?
+    assert topic.errors[:base].include?(ERROR_MESSAGE)
+  end
+
+  test "passes all configuration options to the validator class" do
+    topic = Topic.new
+    validator = Minitest::Mock.new
+    validator.expect(:new, validator, [{foo: :bar, if: "1 == 1", class: Topic}])
+    validator.expect(:validate, nil, [topic])
+    validator.expect(:is_a?, false, [Symbol])
+    validator.expect(:is_a?, false, [String])
+
+    Topic.validates_with(validator, if: "1 == 1", foo: :bar)
+    assert topic.valid?
+    validator.verify
+  end
+
+  test "validates_with with options" do
+    Topic.validates_with(ValidatorThatValidatesOptions, field: :first_name)
+    topic = Topic.new
+    assert topic.invalid?
+    assert topic.errors[:base].include?(ERROR_MESSAGE)
+  end
+
+  test "validates_with each validator" do
+    Topic.validates_with(ValidatorPerEachAttribute, attributes: [:title, :content])
+    topic = Topic.new title: "Title", content: "Content"
+    assert topic.invalid?
+    assert_equal ["Value is Title"], topic.errors[:title]
+    assert_equal ["Value is Content"], topic.errors[:content]
+  end
+
+  test "each validator checks validity" do
+    assert_raise RuntimeError do
+      Topic.validates_with(ValidatorCheckValidity, attributes: [:title])
+    end
+  end
+
+  test "each validator expects attributes to be given" do
+    assert_raise ArgumentError do
+      Topic.validates_with(ValidatorPerEachAttribute)
+    end
+  end
+
+  test "each validator skip nil values if :allow_nil is set to true" do
+    Topic.validates_with(ValidatorPerEachAttribute, attributes: [:title, :content], allow_nil: true)
+    topic = Topic.new content: ""
+    assert topic.invalid?
+    assert topic.errors[:title].empty?
+    assert_equal ["Value is "], topic.errors[:content]
+  end
+
+  test "each validator skip blank values if :allow_blank is set to true" do
+    Topic.validates_with(ValidatorPerEachAttribute, attributes: [:title, :content], allow_blank: true)
+    topic = Topic.new content: ""
+    assert topic.valid?
+    assert topic.errors[:title].empty?
+    assert topic.errors[:content].empty?
+  end
+
+  test "validates_with can validate with an instance method" do
+    Topic.validates :title, with: :my_validation
+
+    topic = Topic.new title: "foo"
+    assert topic.valid?
+    assert topic.errors[:title].empty?
+
+    topic = Topic.new
+    assert !topic.valid?
+    assert_equal ["is missing"], topic.errors[:title]
+  end
+
+  test "optionally pass in the attribute being validated when validating with an instance method" do
+    Topic.validates :title, :content, with: :my_validation_with_arg
+
+    topic = Topic.new title: "foo"
+    assert !topic.valid?
+    assert topic.errors[:title].empty?
+    assert_equal ["is missing"], topic.errors[:content]
+  end
+end
+require "active_support/callbacks"
+require "active_support/core_ext/module/attribute_accessors_per_thread"
+require "concurrent"
+
+module ActionCable
+  module Server
+    # Worker used by Server.send_async to do connection work in threads.
+    class Worker # :nodoc:
+      include ActiveSupport::Callbacks
+
+      thread_mattr_accessor :connection
+      define_callbacks :work
+      include ActiveRecordConnectionManagement
+
+      attr_reader :executor
+
+      def initialize(max_size: 5)
+        @executor = Concurrent::ThreadPoolExecutor.new(
+          min_threads: 1,
+          max_threads: max_size,
+          max_queue: 0,
+        )
+      end
+
+      # Stop processing work: any work that has not already started
+      # running will be discarded from the queue
+      def halt
+        @executor.kill
+      end
+
+      def stopping?
+        @executor.shuttingdown?
+      end
+
+      def work(connection)
+        self.connection = connection
+
+        run_callbacks :work do
+          yield
+        end
+      ensure
+        self.connection = nil
+      end
+
+      def async_exec(receiver, *args, connection:, &block)
+        async_invoke receiver, :instance_exec, *args, connection: connection, &block
+      end
+
+      def async_invoke(receiver, method, *args, connection: receiver, &block)
+        @executor.post do
+          invoke(receiver, method, *args, connection: connection, &block)
+        end
+      end
+
+      def invoke(receiver, method, *args, connection:, &block)
+        work(connection) do
+          begin
+            receiver.send method, *args, &block
+          rescue Exception => e
+            logger.error "There was an exception - #{e.class}(#{e.message})"
+            logger.error e.backtrace.join("\n")
+
+            receiver.handle_exception if receiver.respond_to?(:handle_exception)
+          end
+        end
+      end
+
+      private
+
+        def logger
+          ActionCable.server.logger
+        end
+    end
+  end
+end
+require "test_helper"
+
+class WorkerTest < ActiveSupport::TestCase
+  class Receiver
+    attr_accessor :last_action
+
+    def run
+      @last_action = :run
+    end
+
+    def process(message)
+      @last_action =  [ :process, message ]
+    end
+
+    def connection
+      self
+    end
+
+    def logger
+      # Impersonating a connection requires a TaggedLoggerProxy'ied logger.
+      inner_logger = Logger.new(StringIO.new).tap { |l| l.level = Logger::UNKNOWN }
+      ActionCable::Connection::TaggedLoggerProxy.new(inner_logger, tags: [])
+    end
+  end
+
+  setup do
+    @worker = ActionCable::Server::Worker.new
+    @receiver = Receiver.new
+  end
+
+  teardown do
+    @receiver.last_action = nil
+  end
+
+  test "invoke" do
+    @worker.invoke @receiver, :run, connection: @receiver.connection
+    assert_equal :run, @receiver.last_action
+  end
+
+  test "invoke with arguments" do
+    @worker.invoke @receiver, :process, "Hello", connection: @receiver.connection
+    assert_equal [ :process, "Hello" ], @receiver.last_action
+  end
+end
+class Array
+  # Wraps its argument in an array unless it is already an array (or array-like).
+  #
+  # Specifically:
+  #
+  # * If the argument is +nil+ an empty array is returned.
+  # * Otherwise, if the argument responds to +to_ary+ it is invoked, and its result returned.
+  # * Otherwise, returns an array with the argument as its single element.
+  #
+  #     Array.wrap(nil)       # => []
+  #     Array.wrap([1, 2, 3]) # => [1, 2, 3]
+  #     Array.wrap(0)         # => [0]
+  #
+  # This method is similar in purpose to <tt>Kernel#Array</tt>, but there are some differences:
+  #
+  # * If the argument responds to +to_ary+ the method is invoked. <tt>Kernel#Array</tt>
+  #   moves on to try +to_a+ if the returned value is +nil+, but <tt>Array.wrap</tt> returns
+  #   an array with the argument as its single element right away.
+  # * If the returned value from +to_ary+ is neither +nil+ nor an +Array+ object, <tt>Kernel#Array</tt>
+  #   raises an exception, while <tt>Array.wrap</tt> does not, it just returns the value.
+  # * It does not call +to_a+ on the argument, if the argument does not respond to +to_ary+
+  #   it returns an array with the argument as its single element.
+  #
+  # The last point is easily explained with some enumerables:
+  #
+  #   Array(foo: :bar)      # => [[:foo, :bar]]
+  #   Array.wrap(foo: :bar) # => [{:foo=>:bar}]
+  #
+  # There's also a related idiom that uses the splat operator:
+  #
+  #   [*object]
+  #
+  # which returns <tt>[]</tt> for +nil+, but calls to <tt>Array(object)</tt> otherwise.
+  #
+  # The differences with <tt>Kernel#Array</tt> explained above
+  # apply to the rest of <tt>object</tt>s.
+  def self.wrap(object)
+    if object.nil?
+      []
+    elsif object.respond_to?(:to_ary)
+      object.to_ary || [object]
+    else
+      [object]
+    end
+  end
+end
+require "abstract_unit"
+require "active_support/core_ext/array"
+
+class WrapTest < ActiveSupport::TestCase
+  class FakeCollection
+    def to_ary
+      ["foo", "bar"]
+    end
+  end
+
+  class Proxy
+    def initialize(target) @target = target end
+    def method_missing(*a) @target.send(*a) end
+  end
+
+  class DoubtfulToAry
+    def to_ary
+      :not_an_array
+    end
+  end
+
+  class NilToAry
+    def to_ary
+      nil
+    end
+  end
+
+  def test_array
+    ary = %w(foo bar)
+    assert_same ary, Array.wrap(ary)
+  end
+
+  def test_nil
+    assert_equal [], Array.wrap(nil)
+  end
+
+  def test_object
+    o = Object.new
+    assert_equal [o], Array.wrap(o)
+  end
+
+  def test_string
+    assert_equal ["foo"], Array.wrap("foo")
+  end
+
+  def test_string_with_newline
+    assert_equal ["foo\nbar"], Array.wrap("foo\nbar")
+  end
+
+  def test_object_with_to_ary
+    assert_equal ["foo", "bar"], Array.wrap(FakeCollection.new)
+  end
+
+  def test_proxy_object
+    p = Proxy.new(Object.new)
+    assert_equal [p], Array.wrap(p)
+  end
+
+  def test_proxy_to_object_with_to_ary
+    p = Proxy.new(FakeCollection.new)
+    assert_equal [p], Array.wrap(p)
+  end
+
+  def test_struct
+    o = Struct.new(:foo).new(123)
+    assert_equal [o], Array.wrap(o)
+  end
+
+  def test_wrap_returns_wrapped_if_to_ary_returns_nil
+    o = NilToAry.new
+    assert_equal [o], Array.wrap(o)
+  end
+
+  def test_wrap_does_not_complain_if_to_ary_does_not_return_an_array
+    assert_equal DoubtfulToAry.new.to_ary, Array.wrap(DoubtfulToAry.new)
+  end
+end
+module ActiveRecord
+  module AttributeMethods
+    module Write
+      extend ActiveSupport::Concern
+
+      included do
+        attribute_method_suffix "="
+      end
+
+      module ClassMethods
+        protected
+
+          def define_method_attribute=(name)
+            safe_name = name.unpack("h*".freeze).first
+            ActiveRecord::AttributeMethods::AttrNames.set_name_cache safe_name, name
+
+            generated_attribute_methods.module_eval <<-STR, __FILE__, __LINE__ + 1
+            def __temp__#{safe_name}=(value)
+              name = ::ActiveRecord::AttributeMethods::AttrNames::ATTR_#{safe_name}
+              write_attribute(name, value)
+            end
+            alias_method #{(name + '=').inspect}, :__temp__#{safe_name}=
+            undef_method :__temp__#{safe_name}=
+          STR
+          end
+      end
+
+      # Updates the attribute identified by <tt>attr_name</tt> with the
+      # specified +value+. Empty strings for Integer and Float columns are
+      # turned into +nil+.
+      def write_attribute(attr_name, value)
+        write_attribute_with_type_cast(attr_name, value, true)
+      end
+
+      def raw_write_attribute(attr_name, value) # :nodoc:
+        write_attribute_with_type_cast(attr_name, value, false)
+      end
+
+      private
+      # Handle *= for method_missing.
+        def attribute=(attribute_name, value)
+          write_attribute(attribute_name, value)
+        end
+
+        def write_attribute_with_type_cast(attr_name, value, should_type_cast)
+          attr_name = attr_name.to_s
+          attr_name = self.class.primary_key if attr_name == "id" && self.class.primary_key
+
+          if should_type_cast
+            @attributes.write_from_user(attr_name, value)
+          else
+            @attributes.write_cast_value(attr_name, value)
+          end
+
+          value
+        end
+    end
+  end
+end
+require "time"
+require "base64"
+require "bigdecimal"
+require "active_support/core_ext/module/delegation"
+require "active_support/core_ext/string/inflections"
+require "active_support/core_ext/date_time/calculations"
+
+module ActiveSupport
+  # = XmlMini
+  #
+  # To use the much faster libxml parser:
+  #   gem 'libxml-ruby', '=0.9.7'
+  #   XmlMini.backend = 'LibXML'
+  module XmlMini
+    extend self
+
+    # This module decorates files deserialized using Hash.from_xml with
+    # the <tt>original_filename</tt> and <tt>content_type</tt> methods.
+    module FileLike #:nodoc:
+      attr_writer :original_filename, :content_type
+
+      def original_filename
+        @original_filename || "untitled"
+      end
+
+      def content_type
+        @content_type || "application/octet-stream"
+      end
+    end
+
+    DEFAULT_ENCODINGS = {
+      "binary" => "base64"
+    } unless defined?(DEFAULT_ENCODINGS)
+
+    unless defined?(TYPE_NAMES)
+      TYPE_NAMES = {
+        "Symbol"     => "symbol",
+        "Integer"    => "integer",
+        "BigDecimal" => "decimal",
+        "Float"      => "float",
+        "TrueClass"  => "boolean",
+        "FalseClass" => "boolean",
+        "Date"       => "date",
+        "DateTime"   => "dateTime",
+        "Time"       => "dateTime",
+        "Array"      => "array",
+        "Hash"       => "hash"
+      }
+
+      # No need to map these on Ruby 2.4+
+      TYPE_NAMES["Fixnum"] = "integer" unless Fixnum == Integer
+      TYPE_NAMES["Bignum"] = "integer" unless Bignum == Integer
+    end
+
+    FORMATTING = {
+      "symbol"   => Proc.new { |symbol| symbol.to_s },
+      "date"     => Proc.new { |date| date.to_s(:db) },
+      "dateTime" => Proc.new { |time| time.xmlschema },
+      "binary"   => Proc.new { |binary| ::Base64.encode64(binary) },
+      "yaml"     => Proc.new { |yaml| yaml.to_yaml }
+    } unless defined?(FORMATTING)
+
+    # TODO use regexp instead of Date.parse
+    unless defined?(PARSING)
+      PARSING = {
+        "symbol"       => Proc.new { |symbol|  symbol.to_s.to_sym },
+        "date"         => Proc.new { |date|    ::Date.parse(date) },
+        "datetime"     => Proc.new { |time|    Time.xmlschema(time).utc rescue ::DateTime.parse(time).utc },
+        "integer"      => Proc.new { |integer| integer.to_i },
+        "float"        => Proc.new { |float|   float.to_f },
+        "decimal"      => Proc.new { |number|  BigDecimal(number) },
+        "boolean"      => Proc.new { |boolean| %w(1 true).include?(boolean.to_s.strip) },
+        "string"       => Proc.new { |string|  string.to_s },
+        "yaml"         => Proc.new { |yaml|    YAML::load(yaml) rescue yaml },
+        "base64Binary" => Proc.new { |bin|     ::Base64.decode64(bin) },
+        "binary"       => Proc.new { |bin, entity| _parse_binary(bin, entity) },
+        "file"         => Proc.new { |file, entity| _parse_file(file, entity) }
+      }
+
+      PARSING.update(
+        "double"   => PARSING["float"],
+        "dateTime" => PARSING["datetime"]
+      )
+    end
+
+    attr_accessor :depth
+    self.depth = 100
+
+    delegate :parse, to: :backend
+
+    def backend
+      current_thread_backend || @backend
+    end
+
+    def backend=(name)
+      backend = name && cast_backend_name_to_module(name)
+      self.current_thread_backend = backend if current_thread_backend
+      @backend = backend
+    end
+
+    def with_backend(name)
+      old_backend = current_thread_backend
+      self.current_thread_backend = name && cast_backend_name_to_module(name)
+      yield
+    ensure
+      self.current_thread_backend = old_backend
+    end
+
+    def to_tag(key, value, options)
+      type_name = options.delete(:type)
+      merged_options = options.merge(root: key, skip_instruct: true)
+
+      if value.is_a?(::Method) || value.is_a?(::Proc)
+        if value.arity == 1
+          value.call(merged_options)
+        else
+          value.call(merged_options, key.to_s.singularize)
+        end
+      elsif value.respond_to?(:to_xml)
+        value.to_xml(merged_options)
+      else
+        type_name ||= TYPE_NAMES[value.class.name]
+        type_name ||= value.class.name if value && !value.respond_to?(:to_str)
+        type_name   = type_name.to_s   if type_name
+        type_name   = "dateTime" if type_name == "datetime"
+
+        key = rename_key(key.to_s, options)
+
+        attributes = options[:skip_types] || type_name.nil? ? { } : { type: type_name }
+        attributes[:nil] = true if value.nil?
+
+        encoding = options[:encoding] || DEFAULT_ENCODINGS[type_name]
+        attributes[:encoding] = encoding if encoding
+
+        formatted_value = FORMATTING[type_name] && !value.nil? ?
+          FORMATTING[type_name].call(value) : value
+
+        options[:builder].tag!(key, formatted_value, attributes)
+      end
+    end
+
+    def rename_key(key, options = {})
+      camelize  = options[:camelize]
+      dasherize = !options.has_key?(:dasherize) || options[:dasherize]
+      if camelize
+        key = true == camelize ? key.camelize : key.camelize(camelize)
+      end
+      key = _dasherize(key) if dasherize
+      key
+    end
+
+    protected
+
+      def _dasherize(key)
+        # $2 must be a non-greedy regex for this to work
+        left, middle, right = /\A(_*)(.*?)(_*)\Z/.match(key.strip)[1,3]
+        "#{left}#{middle.tr('_ ', '--')}#{right}"
+      end
+
+    # TODO: Add support for other encodings
+      def _parse_binary(bin, entity) #:nodoc:
+        case entity["encoding"]
+        when "base64"
+          ::Base64.decode64(bin)
+        else
+          bin
+        end
+      end
+
+      def _parse_file(file, entity)
+        f = StringIO.new(::Base64.decode64(file))
+        f.extend(FileLike)
+        f.original_filename = entity["name"]
+        f.content_type = entity["content_type"]
+        f
+      end
+
+    private
+
+      def current_thread_backend
+        Thread.current[:xml_mini_backend]
+      end
+
+      def current_thread_backend=(name)
+        Thread.current[:xml_mini_backend] = name && cast_backend_name_to_module(name)
+      end
+
+      def cast_backend_name_to_module(name)
+        if name.is_a?(Module)
+          name
+        else
+          require "active_support/xml_mini/#{name.downcase}"
+          ActiveSupport.const_get("XmlMini_#{name}")
+        end
+      end
+  end
+
+  XmlMini.backend = "REXML"
+end
+require "abstract_unit"
+require "active_support/xml_mini"
+require "active_support/builder"
+require "active_support/core_ext/hash"
+require "active_support/core_ext/big_decimal"
+require "yaml"
+
+module XmlMiniTest
+  class RenameKeyTest < ActiveSupport::TestCase
+    def test_rename_key_dasherizes_by_default
+      assert_equal "my-key", ActiveSupport::XmlMini.rename_key("my_key")
+    end
+
+    def test_rename_key_dasherizes_with_dasherize_true
+      assert_equal "my-key", ActiveSupport::XmlMini.rename_key("my_key", dasherize: true)
+    end
+
+    def test_rename_key_does_nothing_with_dasherize_false
+      assert_equal "my_key", ActiveSupport::XmlMini.rename_key("my_key", dasherize: false)
+    end
+
+    def test_rename_key_camelizes_with_camelize_true
+      assert_equal "MyKey", ActiveSupport::XmlMini.rename_key("my_key", camelize: true)
+    end
+
+    def test_rename_key_lower_camelizes_with_camelize_lower
+      assert_equal "myKey", ActiveSupport::XmlMini.rename_key("my_key", camelize: :lower)
+    end
+
+    def test_rename_key_lower_camelizes_with_camelize_upper
+      assert_equal "MyKey", ActiveSupport::XmlMini.rename_key("my_key", camelize: :upper)
+    end
+
+    def test_rename_key_does_not_dasherize_leading_underscores
+      assert_equal "_id", ActiveSupport::XmlMini.rename_key("_id")
+    end
+
+    def test_rename_key_with_leading_underscore_dasherizes_interior_underscores
+      assert_equal "_my-key", ActiveSupport::XmlMini.rename_key("_my_key")
+    end
+
+    def test_rename_key_does_not_dasherize_trailing_underscores
+      assert_equal "id_", ActiveSupport::XmlMini.rename_key("id_")
+    end
+
+    def test_rename_key_with_trailing_underscore_dasherizes_interior_underscores
+      assert_equal "my-key_", ActiveSupport::XmlMini.rename_key("my_key_")
+    end
+
+    def test_rename_key_does_not_dasherize_multiple_leading_underscores
+      assert_equal "__id", ActiveSupport::XmlMini.rename_key("__id")
+    end
+
+    def test_rename_key_does_not_dasherize_multiple_trailing_underscores
+      assert_equal "id__", ActiveSupport::XmlMini.rename_key("id__")
+    end
+  end
+
+  class ToTagTest < ActiveSupport::TestCase
+    def assert_xml(xml)
+      assert_equal xml, @options[:builder].target!
+    end
+
+    def setup
+      @xml = ActiveSupport::XmlMini
+      @options = {skip_instruct: true, builder: Builder::XmlMarkup.new}
+    end
+
+    test "#to_tag accepts a callable object and passes options with the builder" do
+      @xml.to_tag(:some_tag, lambda {|o| o[:builder].br }, @options)
+      assert_xml "<br/>"
+    end
+
+    test "#to_tag accepts a callable object and passes options and tag name" do
+      @xml.to_tag(:tag, lambda {|o, t| o[:builder].b(t) }, @options)
+      assert_xml "<b>tag</b>"
+    end
+
+    test "#to_tag accepts an object responding to #to_xml and passes the options, where :root is key" do
+      obj = Object.new
+      obj.instance_eval do
+        def to_xml(options) options[:builder].yo(options[:root].to_s) end
+      end
+
+      @xml.to_tag(:tag, obj, @options)
+      assert_xml "<yo>tag</yo>"
+    end
+
+    test "#to_tag accepts arbitrary objects responding to #to_str" do
+      @xml.to_tag(:b, "Howdy", @options)
+      assert_xml "<b>Howdy</b>"
+    end
+
+    test "#to_tag should use the type value in the options hash" do
+      @xml.to_tag(:b, "blue", @options.merge(type: "color"))
+      assert_xml( "<b type=\"color\">blue</b>" )
+    end
+
+    test "#to_tag accepts symbol types" do
+      @xml.to_tag(:b, :name, @options)
+      assert_xml( "<b type=\"symbol\">name</b>" )
+    end
+
+    test "#to_tag accepts boolean types" do
+      @xml.to_tag(:b, true, @options)
+      assert_xml( "<b type=\"boolean\">true</b>")
+    end
+
+    test "#to_tag accepts float types" do
+      @xml.to_tag(:b, 3.14, @options)
+      assert_xml( "<b type=\"float\">3.14</b>")
+    end
+
+    test "#to_tag accepts decimal types" do
+      @xml.to_tag(:b, ::BigDecimal.new("1.2"), @options)
+      assert_xml( "<b type=\"decimal\">1.2</b>")
+    end
+
+    test "#to_tag accepts date types" do
+      @xml.to_tag(:b, Date.new(2001,2,3), @options)
+      assert_xml( "<b type=\"date\">2001-02-03</b>")
+    end
+
+    test "#to_tag accepts datetime types" do
+      @xml.to_tag(:b, DateTime.new(2001,2,3,4,5,6,"+7"), @options)
+      assert_xml( "<b type=\"dateTime\">2001-02-03T04:05:06+07:00</b>")
+    end
+
+    test "#to_tag accepts time types" do
+      @xml.to_tag(:b, Time.new(1993, 02, 24, 12, 0, 0, "+09:00"), @options)
+      assert_xml( "<b type=\"dateTime\">1993-02-24T12:00:00+09:00</b>")
+    end
+
+    test "#to_tag accepts array types" do
+      @xml.to_tag(:b, ["first_name", "last_name"], @options)
+      assert_xml( "<b type=\"array\"><b>first_name</b><b>last_name</b></b>" )
+    end
+
+    test "#to_tag accepts hash types" do
+      @xml.to_tag(:b, { first_name: "Bob", last_name: "Marley" }, @options)
+      assert_xml( "<b><first-name>Bob</first-name><last-name>Marley</last-name></b>" )
+    end
+
+    test "#to_tag should not add type when skip types option is set" do
+      @xml.to_tag(:b, "Bob", @options.merge(skip_types: 1))
+      assert_xml( "<b>Bob</b>" )
+    end
+
+    test "#to_tag should dasherize the space when passed a string with spaces as a key" do
+      @xml.to_tag("New   York", 33, @options)
+      assert_xml "<New---York type=\"integer\">33</New---York>"
+    end
+
+    test "#to_tag should dasherize the space when passed a symbol with spaces as a key" do
+      @xml.to_tag(:"New   York", 33, @options)
+      assert_xml "<New---York type=\"integer\">33</New---York>"
+    end
+  end
+
+  class WithBackendTest < ActiveSupport::TestCase
+    module REXML end
+    module LibXML end
+    module Nokogiri end
+
+    setup do
+      @xml, @default_backend = ActiveSupport::XmlMini, ActiveSupport::XmlMini.backend
+    end
+
+    teardown do
+      ActiveSupport::XmlMini.backend = @default_backend
+    end
+
+    test "#with_backend should switch backend and then switch back" do
+      @xml.backend = REXML
+      @xml.with_backend(LibXML) do
+        assert_equal LibXML, @xml.backend
+        @xml.with_backend(Nokogiri) do
+          assert_equal Nokogiri, @xml.backend
+        end
+        assert_equal LibXML, @xml.backend
+      end
+      assert_equal REXML, @xml.backend
+    end
+
+    test "backend switch inside #with_backend block" do
+      @xml.with_backend(LibXML) do
+        @xml.backend = REXML
+        assert_equal REXML, @xml.backend
+      end
+      assert_equal REXML, @xml.backend
+    end
+  end
+
+  class ThreadSafetyTest < ActiveSupport::TestCase
+    module REXML end
+    module LibXML end
+
+    setup do
+      @xml, @default_backend = ActiveSupport::XmlMini, ActiveSupport::XmlMini.backend
+    end
+
+    teardown do
+      ActiveSupport::XmlMini.backend = @default_backend
+    end
+
+    test "#with_backend should be thread-safe" do
+      @xml.backend = REXML
+      t = Thread.new do
+        @xml.with_backend(LibXML) { sleep 1 }
+      end
+      sleep 0.1 while t.status != "sleep"
+
+      # We should get `old_backend` here even while another
+      # thread is using `new_backend`.
+      assert_equal REXML, @xml.backend
+    end
+
+    test "nested #with_backend should be thread-safe" do
+      @xml.with_backend(REXML) do
+        t = Thread.new do
+          @xml.with_backend(LibXML) { sleep 1 }
+        end
+        sleep 0.1 while t.status != "sleep"
+
+        assert_equal REXML, @xml.backend
+      end
+    end
+  end
+
+  class ParsingTest < ActiveSupport::TestCase
+    def setup
+      @parsing = ActiveSupport::XmlMini::PARSING
+    end
+
+    def test_symbol
+      parser = @parsing["symbol"]
+      assert_equal :symbol, parser.call("symbol")
+      assert_equal :symbol, parser.call(:symbol)
+      assert_equal :'123', parser.call(123)
+      assert_raises(ArgumentError) { parser.call(Date.new(2013,11,12,02,11)) }
+    end
+
+    def test_date
+      parser = @parsing["date"]
+      assert_equal Date.new(2013,11,12), parser.call("2013-11-12T0211Z")
+      assert_raises(TypeError) { parser.call(1384190018) }
+      assert_raises(ArgumentError) { parser.call("not really a date") }
+    end
+
+    def test_datetime
+      parser = @parsing["datetime"]
+      assert_equal Time.new(2013,11,12,02,11,00,0), parser.call("2013-11-12T02:11:00Z")
+      assert_equal DateTime.new(2013,11,12), parser.call("2013-11-12T0211Z")
+      assert_equal DateTime.new(2013,11,12,02,11), parser.call("2013-11-12T02:11Z")
+      assert_equal DateTime.new(2013,11,12,02,11), parser.call("2013-11-12T11:11+9")
+      assert_raises(ArgumentError) { parser.call("1384190018") }
+    end
+
+    def test_integer
+      parser = @parsing["integer"]
+      assert_equal 123, parser.call(123)
+      assert_equal 123, parser.call(123.003)
+      assert_equal 123, parser.call("123")
+      assert_equal 0, parser.call("")
+      assert_raises(ArgumentError) { parser.call(Date.new(2013,11,12,02,11)) }
+    end
+
+    def test_float
+      parser = @parsing["float"]
+      assert_equal 123, parser.call("123")
+      assert_equal 123.003, parser.call("123.003")
+      assert_equal 123.0, parser.call("123,003")
+      assert_equal 0.0, parser.call("")
+      assert_equal 123, parser.call(123)
+      assert_equal 123.05, parser.call(123.05)
+      assert_raises(ArgumentError) { parser.call(Date.new(2013,11,12,02,11)) }
+    end
+
+    def test_decimal
+      parser = @parsing["decimal"]
+      assert_equal 123, parser.call("123")
+      assert_equal 123.003, parser.call("123.003")
+      assert_equal 123.0, parser.call("123,003")
+      assert_equal 0.0, parser.call("")
+      assert_equal 123, parser.call(123)
+      assert_raises(ArgumentError) { parser.call(123.04) }
+      assert_raises(ArgumentError) { parser.call(Date.new(2013,11,12,02,11)) }
+    end
+
+    def test_boolean
+      parser = @parsing["boolean"]
+      [1, true, "1"].each do |value|
+        assert parser.call(value)
+      end
+
+      [0, false, "0"].each do |value|
+        assert_not parser.call(value)
+      end
+    end
+
+    def test_string
+      parser = @parsing["string"]
+      assert_equal "123", parser.call(123)
+      assert_equal "123", parser.call("123")
+      assert_equal "[]", parser.call("[]")
+      assert_equal "[]", parser.call([])
+      assert_equal "{}", parser.call({})
+      assert_raises(ArgumentError) { parser.call(Date.new(2013,11,12,02,11)) }
+    end
+
+    def test_yaml
+      yaml = <<YAML
+product:
+  - sku         : BL394D
+    quantity    : 4
+    description : Basketball
+YAML
+      expected = {
+        "product"=> [
+          {"sku"=>"BL394D", "quantity"=>4, "description"=>"Basketball"}
+        ]
+      }
+      parser = @parsing["yaml"]
+      assert_equal(expected, parser.call(yaml))
+      assert_equal({1 => "test"}, parser.call(1 => "test"))
+      assert_equal({"1 => 'test'"=>nil}, parser.call("{1 => 'test'}"))
+    end
+
+    def test_base64Binary_and_binary
+      base64 = <<BASE64
+TWFuIGlzIGRpc3Rpbmd1aXNoZWQsIG5vdCBvbmx5IGJ5IGhpcyByZWFzb24sIGJ1dCBieSB0aGlz
+IHNpbmd1bGFyIHBhc3Npb24gZnJvbSBvdGhlciBhbmltYWxzLCB3aGljaCBpcyBhIGx1c3Qgb2Yg
+dGhlIG1pbmQsIHRoYXQgYnkgYSBwZXJzZXZlcmFuY2Ugb2YgZGVsaWdodCBpbiB0aGUgY29udGlu
+dWVkIGFuZCBpbmRlZmF0aWdhYmxlIGdlbmVyYXRpb24gb2Yga25vd2xlZGdlLCBleGNlZWRzIHRo
+ZSBzaG9ydCB2ZWhlbWVuY2Ugb2YgYW55IGNhcm5hbCBwbGVhc3VyZS4=
+BASE64
+      expected_base64 = <<EXPECTED
+Man is distinguished, not only by his reason, but by this singular passion from
+other animals, which is a lust of the mind, that by a perseverance of delight
+in the continued and indefatigable generation of knowledge, exceeds the short
+vehemence of any carnal pleasure.
+EXPECTED
+
+      parser = @parsing["base64Binary"]
+      assert_equal expected_base64.gsub(/\n/," ").strip, parser.call(base64)
+      parser.call("NON BASE64 INPUT")
+
+      parser = @parsing["binary"]
+      assert_equal expected_base64.gsub(/\n/," ").strip, parser.call(base64, "encoding" => "base64")
+      assert_equal "IGNORED INPUT", parser.call("IGNORED INPUT", {})
+    end
+  end
+end
+module ActiveRecord
+  module ConnectionAdapters
+    module PostgreSQL
+      module OID # :nodoc:
+        class Xml < Type::String # :nodoc:
+          def type
+            :xml
+          end
+
+          def serialize(value)
+            return unless value
+            Data.new(super)
+          end
+
+          class Data # :nodoc:
+            def initialize(value)
+              @value = value
+            end
+
+            def to_s
+              @value
+            end
+          end
+        end
+      end
+    end
+  end
+end
+require "cases/helper"
+require "support/schema_dumping_helper"
+
+class PostgresqlXMLTest < ActiveRecord::PostgreSQLTestCase
+  include SchemaDumpingHelper
+  class XmlDataType < ActiveRecord::Base
+    self.table_name = "xml_data_type"
+  end
+
+  def setup
+    @connection = ActiveRecord::Base.connection
+    begin
+      @connection.transaction do
+        @connection.create_table("xml_data_type") do |t|
+          t.xml "payload"
+        end
+      end
+    rescue ActiveRecord::StatementInvalid
+      skip "do not test on PG without xml"
+    end
+    @column = XmlDataType.columns_hash["payload"]
+  end
+
+  teardown do
+    @connection.drop_table "xml_data_type", if_exists: true
+  end
+
+  def test_column
+    assert_equal :xml, @column.type
+  end
+
+  def test_null_xml
+    @connection.execute "insert into xml_data_type (payload) VALUES(null)"
+    assert_nil XmlDataType.first.payload
+  end
+
+  def test_round_trip
+    data = XmlDataType.new(payload: "<foo>bar</foo>")
+    assert_equal "<foo>bar</foo>", data.payload
+    data.save!
+    assert_equal "<foo>bar</foo>", data.reload.payload
+  end
+
+  def test_update_all
+    data = XmlDataType.create!
+    XmlDataType.update_all(payload: "<bar>baz</bar>")
+    assert_equal "<bar>baz</bar>", data.reload.payload
+  end
+
+  def test_schema_dump_with_shorthand
+    output = dump_table_schema("xml_data_type")
+    assert_match %r{t\.xml "payload"}, output
+  end
+end
+require "yaml"
+require "active_support/core_ext/regexp"
+
+module ActiveRecord
+  module Coders # :nodoc:
+    class YAMLColumn # :nodoc:
+      attr_accessor :object_class
+
+      def initialize(object_class = Object)
+        @object_class = object_class
+        check_arity_of_constructor
+      end
+
+      def dump(obj)
+        return if obj.nil?
+
+        assert_valid_value(obj)
+        YAML.dump obj
+      end
+
+      def load(yaml)
+        return object_class.new if object_class != Object && yaml.nil?
+        return yaml unless yaml.is_a?(String) && /^---/.match?(yaml)
+        obj = YAML.load(yaml)
+
+        assert_valid_value(obj)
+        obj ||= object_class.new if object_class != Object
+
+        obj
+      end
+
+      def assert_valid_value(obj)
+        unless obj.nil? || obj.is_a?(object_class)
+          raise SerializationTypeMismatch,
+            "Attribute was supposed to be a #{object_class}, but was a #{obj.class}. -- #{obj.inspect}"
+        end
+      end
+
+      private
+
+        def check_arity_of_constructor
+          begin
+            load(nil)
+          rescue ArgumentError
+            raise ArgumentError, "Cannot serialize #{object_class}. Classes passed to `serialize` must have a 0 argument constructor."
+          end
+        end
+    end
+  end
+end
+
+require "cases/helper"
+
+module ActiveRecord
+  module Coders
+    class YAMLColumnTest < ActiveRecord::TestCase
+      def test_initialize_takes_class
+        coder = YAMLColumn.new(Object)
+        assert_equal Object, coder.object_class
+      end
+
+      def test_type_mismatch_on_different_classes_on_dump
+        coder = YAMLColumn.new(Array)
+        assert_raises(SerializationTypeMismatch) do
+          coder.dump("a")
+        end
+      end
+
+      def test_type_mismatch_on_different_classes
+        coder = YAMLColumn.new(Array)
+        assert_raises(SerializationTypeMismatch) do
+          coder.load "--- foo"
+        end
+      end
+
+      def test_nil_is_ok
+        coder = YAMLColumn.new
+        assert_nil coder.load "--- "
+      end
+
+      def test_returns_new_with_different_class
+        coder = YAMLColumn.new SerializationTypeMismatch
+        assert_equal SerializationTypeMismatch, coder.load("--- ").class
+      end
+
+      def test_returns_string_unless_starts_with_dash
+        coder = YAMLColumn.new
+        assert_equal "foo", coder.load("foo")
+      end
+
+      def test_load_handles_other_classes
+        coder = YAMLColumn.new
+        assert_equal [], coder.load([])
+      end
+
+      def test_load_doesnt_swallow_yaml_exceptions
+        coder = YAMLColumn.new
+        bad_yaml = "--- {"
+        assert_raises(Psych::SyntaxError) do
+          coder.load(bad_yaml)
+        end
+      end
+
+      def test_load_doesnt_handle_undefined_class_or_module
+        coder = YAMLColumn.new
+        missing_class_yaml = '--- !ruby/object:DoesNotExistAndShouldntEver {}\n'
+        assert_raises(ArgumentError) do
+          coder.load(missing_class_yaml)
+        end
+      end
+    end
+  end
+end
+module ActiveRecord
+  class AttributeSet
+    # Attempts to do more intelligent YAML dumping of an
+    # ActiveRecord::AttributeSet to reduce the size of the resulting string
+    class YAMLEncoder # :nodoc:
+      def initialize(default_types)
+        @default_types = default_types
+      end
+
+      def encode(attribute_set, coder)
+        coder["concise_attributes"] = attribute_set.each_value.map do |attr|
+          if attr.type.equal?(default_types[attr.name])
+            attr.with_type(nil)
+          else
+            attr
+          end
+        end
+      end
+
+      def decode(coder)
+        if coder["attributes"]
+          coder["attributes"]
+        else
+          attributes_hash = Hash[coder["concise_attributes"].map do |attr|
+            if attr.type.nil?
+              attr = attr.with_type(default_types[attr.name])
+            end
+            [attr.name, attr]
+          end]
+          AttributeSet.new(attributes_hash)
+        end
+      end
+
+      protected
+
+        attr_reader :default_types
+    end
+  end
+end
+require "cases/helper"
+require "models/topic"
+require "models/reply"
+require "models/post"
+require "models/author"
+
+class YamlSerializationTest < ActiveRecord::TestCase
+  fixtures :topics, :authors, :posts
+
+  def test_to_yaml_with_time_with_zone_should_not_raise_exception
+    with_timezone_config aware_attributes: true, zone: "Pacific Time (US & Canada)" do
+      topic = Topic.new(written_on: DateTime.now)
+      assert_nothing_raised { topic.to_yaml }
+    end
+  end
+
+  def test_roundtrip
+    topic = Topic.first
+    assert topic
+    t = YAML.load YAML.dump topic
+    assert_equal topic, t
+  end
+
+  def test_roundtrip_serialized_column
+    topic = Topic.new(content: {omg: :lol})
+    assert_equal({omg: :lol}, YAML.load(YAML.dump(topic)).content)
+  end
+
+  def test_psych_roundtrip
+    topic = Topic.first
+    assert topic
+    t = Psych.load Psych.dump topic
+    assert_equal topic, t
+  end
+
+  def test_psych_roundtrip_new_object
+    topic = Topic.new
+    assert topic
+    t = Psych.load Psych.dump topic
+    assert_equal topic.attributes, t.attributes
+  end
+
+  def test_active_record_relation_serialization
+    [Topic.all].to_yaml
+  end
+
+  def test_raw_types_are_not_changed_on_round_trip
+    topic = Topic.new(parent_id: "123")
+    assert_equal "123", topic.parent_id_before_type_cast
+    assert_equal "123", YAML.load(YAML.dump(topic)).parent_id_before_type_cast
+  end
+
+  def test_cast_types_are_not_changed_on_round_trip
+    topic = Topic.new(parent_id: "123")
+    assert_equal 123, topic.parent_id
+    assert_equal 123, YAML.load(YAML.dump(topic)).parent_id
+  end
+
+  def test_new_records_remain_new_after_round_trip
+    topic = Topic.new
+
+    assert topic.new_record?, "Sanity check that new records are new"
+    assert YAML.load(YAML.dump(topic)).new_record?, "Record should be new after deserialization"
+
+    topic.save!
+
+    assert_not topic.new_record?, "Saved records are not new"
+    assert_not YAML.load(YAML.dump(topic)).new_record?, "Saved record should not be new after deserialization"
+
+    topic = Topic.select("title").last
+
+    assert_not topic.new_record?, "Loaded records without ID are not new"
+    assert_not YAML.load(YAML.dump(topic)).new_record?, "Record should not be new after deserialization"
+  end
+
+  def test_types_of_virtual_columns_are_not_changed_on_round_trip
+    author = Author.select("authors.*, count(posts.id) as posts_count")
+      .joins(:posts)
+      .group("authors.id")
+      .first
+    dumped = YAML.load(YAML.dump(author))
+
+    assert_equal 5, author.posts_count
+    assert_equal 5, dumped.posts_count
+  end
+
+  def test_a_yaml_version_is_provided_for_future_backwards_compat
+    coder = {}
+    Topic.first.encode_with(coder)
+
+    assert coder["active_record_yaml_version"]
+  end
+
+  def test_deserializing_rails_41_yaml
+    topic = YAML.load(yaml_fixture("rails_4_1"))
+
+    assert topic.new_record?
+    assert_equal nil, topic.id
+    assert_equal "The First Topic", topic.title
+    assert_equal({ omg: :lol }, topic.content)
+  end
+
+  def test_deserializing_rails_4_2_0_yaml
+    topic = YAML.load(yaml_fixture("rails_4_2_0"))
+
+    assert_not topic.new_record?
+    assert_equal 1, topic.id
+    assert_equal "The First Topic", topic.title
+    assert_equal("Have a nice day", topic.content)
+  end
+
+  def test_yaml_encoding_keeps_mutations
+    author = Author.first
+    author.name = "Sean"
+    dumped = YAML.load(YAML.dump(author))
+
+    assert_equal "Sean", dumped.name
+    assert_equal author.name_was, dumped.name_was
+    assert_equal author.changes, dumped.changes
+  end
+
+  private
+
+    def yaml_fixture(file_name)
+      path = File.expand_path(
+        "../../support/yaml_compatibility_fixtures/#{file_name}.yml",
+        __FILE__
+      )
+      File.read(path)
+    end
+end
+class Zine < ActiveRecord::Base
+  has_many :interests, inverse_of: :zine
+end
+module DateAndTime
+  module Zones
+    # Returns the simultaneous time in <tt>Time.zone</tt> if a zone is given or
+    # if Time.zone_default is set. Otherwise, it returns the current time.
+    #
+    #   Time.zone = 'Hawaii'        # => 'Hawaii'
+    #   Time.utc(2000).in_time_zone # => Fri, 31 Dec 1999 14:00:00 HST -10:00
+    #   Date.new(2000).in_time_zone # => Sat, 01 Jan 2000 00:00:00 HST -10:00
+    #
+    # This method is similar to Time#localtime, except that it uses <tt>Time.zone</tt> as the local zone
+    # instead of the operating system's time zone.
+    #
+    # You can also pass in a TimeZone instance or string that identifies a TimeZone as an argument,
+    # and the conversion will be based on that zone instead of <tt>Time.zone</tt>.
+    #
+    #   Time.utc(2000).in_time_zone('Alaska') # => Fri, 31 Dec 1999 15:00:00 AKST -09:00
+    #   Date.new(2000).in_time_zone('Alaska') # => Sat, 01 Jan 2000 00:00:00 AKST -09:00
+    def in_time_zone(zone = ::Time.zone)
+      time_zone = ::Time.find_zone! zone
+      time = acts_like?(:time) ? self : nil
+
+      if time_zone
+        time_with_zone(time, time_zone)
+      else
+        time || to_time
+      end
+    end
+
+    private
+
+      def time_with_zone(time, zone)
+        if time
+          ActiveSupport::TimeWithZone.new(time.utc? ? time : time.getutc, zone)
+        else
+          ActiveSupport::TimeWithZone.new(nil, zone, to_time(:utc))
+        end
+      end
+  end
+end

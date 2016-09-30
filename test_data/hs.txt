@@ -1,0 +1,2652 @@
+ce name
+                                Just _ -> Just $ UFSnapshot name
+                        -- We don't check for flag presence for extra deps
+                        Just _ -> Nothing
+                -- Package exists locally, let's check if the flags are defined
+                Just pkg ->
+                    let unused = Set.difference (Map.keysSet userFlags) (packageDefinedFlags pkg)
+                     in if Set.null unused
+                            -- All flags are defined, nothing to do
+                            then Nothing
+                            -- Error about the undefined flags
+                            else Just $ UFFlagsNotDefined source pkg unused
+
+        unusedFlags = mapMaybe checkFlagUsed flags
+
+    unless (null unusedFlags)
+        $ throwM
+        $ InvalidFlagSpecification
+        $ Set.fromList unusedFlags
+
+-- | Add in necessary packages to extra dependencies
+--
+-- Originally part of https://github.com/commercialhaskell/stack/issues/272,
+-- this was then superseded by
+-- https://github.com/commercialhaskell/stack/issues/651
+extendExtraDeps
+    :: (HasBuildConfig env, MonadIO m, MonadLogger m, MonadReader env m, HasHttpManager env, MonadBaseControl IO m, MonadMask m)
+    => Map PackageName Version -- ^ original extra deps
+    -> Map PackageName Version -- ^ package identifiers from the command line
+    -> Set PackageName -- ^ all packages added on the command line
+    -> m (Map PackageName Version) -- ^ new extradeps
+extendExtraDeps extraDeps0 cliExtraDeps unknowns = do
+    (errs, unknowns') <- fmap partitionEithers $ mapM addUnknown $ Set.toList unknowns
+    case errs of
+        [] -> return $ Map.unions $ extraDeps1 : unknowns'
+        _ -> do
+            bconfig <- asks getBuildConfig
+            throwM $ UnknownTargets
+                (Set.fromList errs)
+                Map.empty -- TODO check the cliExtraDeps for presence in index
+                (bcStackYaml bconfig)
+  where
+    extraDeps1 = Map.union extraDeps0 cliExtraDeps
+    addUnknown pn = do
+        case Map.lookup pn extraDeps1 of
+            Just _ -> return (Right Map.empty)
+            Nothing -> do
+                mlatestVersion <- getLatestVersion pn
+                case mlatestVersion of
+                    Just v -> return (Right $ Map.singleton pn v)
+                    Nothing -> return (Left pn)
+    getLatestVersion pn = do
+        vs <- getPackageVersions pn
+        return (fmap fst (Set.maxView vs))
+
+-- | Compare the current filesystem state to the cached information, and
+-- determine (1) if the files are dirty, and (2) the new cache values.
+checkBuildCache :: forall m. (MonadIO m)
+                => Map FilePath FileCacheInfo -- ^ old cache
+                -> [Path Abs File] -- ^ files in package
+                -> m (Set FilePath, Map FilePath FileCacheInfo)
+checkBuildCache oldCache files = do
+    fileTimes <- liftM Map.fromList $ forM files $ \fp -> do
+        mmodTime <- liftIO (getModTimeMaybe (toFilePath fp))
+        return (toFilePath fp, mmodTime)
+    liftM (mconcat . Map.elems) $ sequence $
+        Map.mergeWithKey
+            (\fp mmodTime fci -> Just (go fp mmodTime (Just fci)))
+            (Map.mapWithKey (\fp mmodTime -> go fp mmodTime Nothing))
+            (Map.mapWithKey (\fp fci -> go fp Nothing (Just fci)))
+            fileTimes
+            oldCache
+  where
+    go :: FilePath -> Maybe ModTime -> Maybe FileCacheInfo -> m (Set FilePath, Map FilePath FileCacheInfo)
+    -- Filter out the cabal_macros file to avoid spurious recompilations
+    go fp _ _ | takeFileName fp == "cabal_macros.h" = return (Set.empty, Map.empty)
+    -- Common case where it's in the cache and on the filesystem.
+    go fp (Just modTime') (Just fci)
+        | fciModTime fci == modTime' = return (Set.empty, Map.empty)
+        | otherwise = do
+            newFci <- calcFci modTime' fp
+            let isDirty =
+                    fciSize fci /= fciSize newFci ||
+                    fciHash fci /= fciHash newFci
+                newDirty = if isDirty then Set.singleton fp else Set.empty
+            return (newDirty, Map.singleton fp newFci)
+    -- Missing file. Add it to dirty files, but no FileCacheInfo.
+    go fp Nothing _ = return (Set.singleton fp, Map.empty)
+    -- Missing cache. Add it to dirty files and compute FileCacheInfo.
+    go fp (Just modTime') Nothing = do
+        newFci <- calcFci modTime' fp
+        return (Set.singleton fp, Map.singleton fp newFci)
+
+-- | Returns entries to add to the build cache for any newly found unlisted modules
+addUnlistedToBuildCache
+    :: (MonadIO m, MonadReader env m, MonadMask m, MonadLogger m, HasEnvConfig env)
+    => ModTime
+    -> Package
+    -> Path Abs File
+    -> Map FilePath a
+    -> m ([Map FilePath FileCacheInfo], [PackageWarning])
+addUnlistedToBuildCache preBuildTime pkg cabalFP buildCache = do
+    (files,warnings) <- getPackageFilesSimple pkg cabalFP
+    let newFiles =
+            Set.toList $
+            Set.map toFilePath files `Set.difference` Map.keysSet buildCache
+    addBuildCache <- mapM addFileToCache newFiles
+    return (addBuildCache, warnings)
+  where
+    addFileToCache fp = do
+        mmodTime <- getModTimeMaybe fp
+        case mmodTime of
+            Nothing -> return Map.empty
+            Just modTime' ->
+                if modTime' < preBuildTime
+                    then do
+                        newFci <- calcFci modTime' fp
+                        return (Map.singleton fp newFci)
+                    else return Map.empty
+
+-- | Gets list of Paths for files in a package
+getPackageFilesSimple
+    :: (MonadIO m, MonadReader env m, MonadMask m, MonadLogger m, HasEnvConfig env)
+    => Package -> Path Abs File -> m (Set (Path Abs File), [PackageWarning])
+getPackageFilesSimple pkg cabalFP = do
+    (_,compFiles,cabalFiles,warnings) <-
+        getPackageFiles (packageFiles pkg) cabalFP
+    return
+        ( Set.map dotCabalGetPath (mconcat (M.elems compFiles)) <> cabalFiles
+        , warnings)
+
+-- | Get file modification time, if it exists.
+getModTimeMaybe :: MonadIO m => FilePath -> m (Maybe ModTime)
+getModTimeMaybe fp =
+    liftIO
+        (catch
+             (liftM
+                  (Just . modTime)
+                  (D.getModificationTime fp))
+             (\e ->
+                   if isDoesNotExistError e
+                       then return Nothing
+                       else throwM e))
+
+-- | Create FileCacheInfo for a file.
+calcFci :: MonadIO m => ModTime -> FilePath -> m FileCacheInfo
+calcFci modTime' fp = liftIO $
+    withBinaryFile fp ReadMode $ \h -> do
+        (size, digest) <- CB.sourceHandle h $$ getZipSink
+            ((,)
+                <$> ZipSink (CL.fold
+                    (\x y -> x + fromIntegral (S.length y))
+                    0)
+                <*> ZipSink sinkHash)
+        return FileCacheInfo
+            { fciModTime = modTime'
+            , fciSize = size
+            , fciHash = toBytes (digest :: Digest SHA256)
+            }
+
+checkComponentsBuildable :: MonadThrow m => [LocalPackage] -> m ()
+checkComponentsBuildable lps =
+    unless (null unbuildable) $ throwM $ SomeTargetsNotBuildable unbuildable
+  where
+    unbuildable =
+        [ (packageName (lpPackage lp), c)
+        | lp <- lps
+        , c <- Set.toList (lpUnbuildable lp)
+        ]
+
+getDefaultPackageConfig :: (MonadIO m, MonadReader env m, HasEnvConfig env)
+  => m PackageConfig
+getDefaultPackageConfig = do
+  econfig <- asks getEnvConfig
+  bconfig <- asks getBuildConfig
+  return PackageConfig
+    { packageConfigEnableTests = False
+    , packageConfigEnableBenchmarks = False
+    , packageConfigFlags = M.empty
+    , packageConfigGhcOptions = []
+    , packageConfigCompilerVersion = envConfigCompilerVersion econfig
+    , packageConfigPlatform = configPlatform $ getConfig bconfig
+    }
+
+-- | Get 'PackageConfig' for package given its name.
+getPackageConfig :: (MonadIO m, MonadReader env m, HasEnvConfig env)
+  => BuildOptsCLI
+  -> PackageName
+  -> Bool
+  -> Bool
+  -> m PackageConfig
+getPackageConfig boptsCli name isTarget isLocal = do
+  econfig <- asks getEnvConfig
+  bconfig <- asks getBuildConfig
+  return PackageConfig
+    { packageConfigEnableTests = False
+    , packageConfigEnableBenchmarks = False
+    , packageConfigFlags = getLocalFlags bconfig boptsCli name
+    , packageConfigGhcOptions = getGhcOptions bconfig boptsCli name isTarget isLocal
+    , packageConfigCompilerVersion = envConfigCompilerVersion econfig
+    , packageConfigPlatform = configPlatform $ getConfig bconfig
+    }
+{-# OPTIONS_GHC -F -pgmF hspec-discover -optF --module-name=Spec #-}
+module StackTest where
+
+import Control.Monad
+import Control.Monad.IO.Class
+import Control.Monad.Trans.Reader
+import Control.Concurrent
+import Control.Exception
+import Data.List (intercalate)
+import System.Environment
+import System.FilePath
+import System.Directory
+import System.IO
+import System.IO.Error
+import System.Process
+import System.Exit
+import System.Info (os)
+
+run' :: FilePath -> [String] -> IO ExitCode
+run' cmd args = do
+    logInfo $ "Running: " ++ cmd ++ " " ++ intercalate " " (map showProcessArgDebug args)
+    (Nothing, Nothing, Nothing, ph) <- createProcess (proc cmd args)
+    waitForProcess ph
+
+run :: FilePath -> [String] -> IO ()
+run cmd args = do
+    ec <- run' cmd args
+    if ec == ExitSuccess
+        then return ()
+        else error $ "Exited with exit code: " ++ show ec
+
+stack' :: [String] -> IO ExitCode
+stack' args = do
+    stack <- getEnv "STACK_EXE"
+    run' stack args
+
+stack :: [String] -> IO ()
+stack args = do
+    ec <- stack' args
+    if ec == ExitSuccess
+        then return ()
+        else error $ "Exited with exit code: " ++ show ec
+
+stackErr :: [String] -> IO ()
+stackErr args = do
+    ec <- stack' args
+    if ec == ExitSuccess
+        then error "stack was supposed to fail, but didn't"
+        else return ()
+
+type Repl = ReaderT ReplConnection IO
+
+data ReplConnection
+  = ReplConnection
+    { replStdin  :: Handle
+    , replStdout :: Handle
+    }
+
+nextPrompt :: Repl ()
+nextPrompt = do
+    (ReplConnection _ handle) <- ask
+    c <- liftIO $ hGetChar handle
+    if c == '>'
+      then do _ <- liftIO $ hGetChar handle
+              return ()
+      else nextPrompt
+
+replCommand :: String -> Repl ()
+replCommand cmd = do
+    (ReplConnection input _) <- ask
+    liftIO $ hPutStrLn input cmd
+
+replGetLine :: Repl String
+replGetLine = (fmap replStdout ask) >>= liftIO . hGetLine
+
+replGetChar :: Repl Char
+replGetChar = (fmap replStdout ask) >>= liftIO . hGetChar
+
+runRepl :: FilePath -> [String] -> ReaderT ReplConnection IO () -> IO ExitCode
+runRepl cmd args actions = do
+    logInfo $ "Running: " ++ cmd ++ " " ++ intercalate " " (map showProcessArgDebug args)
+    (Just rStdin, Just rStdout, Just rStderr, ph) <-
+        createProcess (proc cmd args)
+        { std_in = CreatePipe
+        , std_out = CreatePipe
+        , std_err = CreatePipe
+        }
+    hSetBuffering rStdin NoBuffering
+    hSetBuffering rStdout NoBuffering
+    hSetBuffering rStderr NoBuffering
+
+    forkIO $ bracket (openFile "/tmp/stderr" WriteMode) hClose
+        $ \err -> forever $ catch (hGetChar rStderr >>= hPutChar err)
+                  $ \e -> if isEOFError e then return () else throw e
+
+    runReaderT (nextPrompt >> actions) (ReplConnection rStdin rStdout)
+    waitForProcess ph
+
+repl :: [String] -> Repl () -> IO ()
+repl args action = do
+    stack <- getEnv "STACK_EXE"
+    ec <- runRepl stack ("repl":args) action
+    if ec == ExitSuccess
+        then return ()
+        else return ()
+        -- TODO: Understand why the exit code is 1 despite running GHCi tests
+        -- successfully.
+        -- else error $ "Exited with exit code: " ++ show ec
+
+-- | Run stack with arguments and apply a check to the resulting
+-- stderr output if the process succeeded.
+stackCheckStderr :: [String] -> (String -> IO ()) -> IO ()
+stackCheckStderr args check = do
+    stack <- getEnv "STACK_EXE"
+    logInfo $ "Running: " ++ stack ++ " " ++ intercalate " " (map showProcessArgDebug args)
+    (ec, _, err) <- readProcessWithExitCode stack args ""
+    hPutStr stderr err
+    if ec /= ExitSuccess
+        then error $ "Exited with exit code: " ++ show ec
+        else check err
+
+doesNotExist :: FilePath -> IO ()
+doesNotExist fp = do
+    logInfo $ "doesNotExist " ++ fp
+    exists <- doesFileOrDirExist fp
+    case exists of
+      (Right msg) -> error msg
+      (Left _) -> return ()
+
+doesExist :: FilePath -> IO ()
+doesExist fp = do
+    logInfo $ "doesExist " ++ fp
+    exists <- doesFileOrDirExist fp
+    case exists of
+      (Right msg) -> return ()
+      (Left _) -> error "No file or directory exists"
+
+doesFileOrDirExist :: FilePath -> IO (Either () String)
+doesFileOrDirExist fp = do
+    isFile <- doesFileExist fp
+    if isFile
+        then return (Right ("File exists: " ++ fp))
+        else do
+            isDir <- doesDirectoryExist fp
+            if isDir
+                then return (Right ("Directory exists: " ++ fp))
+                else return (Left ())
+
+copy :: FilePath -> FilePath -> IO ()
+copy src dest = do
+    logInfo ("Copy " ++ show src ++ " to " ++ show dest)
+    System.Directory.copyFile src dest
+
+fileContentsMatch :: FilePath -> FilePath -> IO ()
+fileContentsMatch f1 f2 = do
+    doesExist f1
+    doesExist f2
+    f1Contents <- readFile f1
+    f2Contents <- readFile f2
+    if f1Contents == f2Contents
+          then return ()
+          else error
+                   ("contents do not match for " ++
+                    show f1 ++
+                    " " ++
+                    show f2)
+
+logInfo :: String -> IO ()
+logInfo = hPutStrLn stderr
+
+-- TODO: use stack's process running utilties?  (better logging)
+-- for now just copy+modifying this one from System.Process.Log
+
+-- | Show a process arg including speechmarks when necessary. Just for
+-- debugging purposes, not functionally important.
+showProcessArgDebug :: String -> String
+showProcessArgDebug x
+    | any special x = show x
+    | otherwise = x
+  where special '"' = True
+        special ' ' = True
+        special _ = False
+
+-- | Extension of executables
+exeExt = if isWindows then ".exe" else ""
+
+-- | Is the OS Windows?
+isWindows = os == "mingw32"
+
+-- | To avoid problems with GHC version mismatch when a new LTS major
+-- version is released, pass this argument to @stack@ when running in
+-- a global context.  The LTS major version here should match that of
+-- the main @stack.yaml@.
+defaultResolverArg = "--resolver=lts-6.0"
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
+-- | The monad used for the command-line executable @stack@.
+
+module Stack.Types.StackT
+  (StackT
+  ,StackLoggingT
+  ,runStackT
+  ,runStackTGlobal
+  ,runStackLoggingT
+  ,runStackLoggingTGlobal
+  ,runInnerStackT
+  ,runInnerStackLoggingT
+  ,newTLSManager
+  ,logSticky
+  ,logStickyDone)
+  where
+
+import           Control.Applicative
+import           Control.Concurrent.MVar
+import           Control.Monad
+import           Control.Monad.Base
+import           Control.Monad.Catch
+import           Control.Monad.IO.Class
+import           Control.Monad.Logger
+import           Control.Monad.Reader
+import           Control.Monad.Trans.Control
+import qualified Data.ByteString.Char8 as S8
+import           Data.Char
+import           Data.Maybe
+import           Data.Monoid
+import           Data.Text (Text)
+import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
+import qualified Data.Text.Encoding.Error as T
+import qualified Data.Text.IO as T
+import           Data.Time
+import           GHC.Foreign (withCString, peekCString)
+import           Language.Haskell.TH
+import           Network.HTTP.Client.Conduit (HasHttpManager(..))
+import           Network.HTTP.Conduit
+import           Prelude -- Fix AMP warning
+import           Stack.Types.Internal
+import           Stack.Types.Config (GlobalOpts (..))
+import           System.IO
+import           System.Log.FastLogger
+import           System.Console.ANSI (hSupportsANSI)
+
+#ifndef MIN_VERSION_time
+#define MIN_VERSION_time(x, y, z) 0
+#endif
+#if !MIN_VERSION_time(1, 5, 0)
+import           System.Locale
+#endif
+
+--------------------------------------------------------------------------------
+-- Main StackT monad transformer
+
+-- | The monad used for the executable @stack@.
+newtype StackT config m a =
+  StackT {unStackT :: ReaderT (Env config) m a}
+  deriving (Functor,Applicative,Monad,MonadIO,MonadReader (Env config),MonadThrow,MonadCatch,MonadMask,MonadTrans)
+
+deriving instance (MonadBase b m) => MonadBase b (StackT config m)
+
+instance MonadBaseControl b m => MonadBaseControl b (StackT config m) where
+    type StM (StackT config m) a = ComposeSt (StackT config) m a
+    liftBaseWith     = defaultLiftBaseWith
+    restoreM         = defaultRestoreM
+
+instance MonadTransControl (StackT config) where
+    type StT (StackT config) a = StT (ReaderT (Env config)) a
+    liftWith = defaultLiftWith StackT unStackT
+    restoreT = defaultRestoreT StackT
+
+-- | Takes the configured log level into account.
+instance (MonadIO m) => MonadLogger (StackT config m) where
+    monadLoggerLog = stickyLoggerFunc
+
+instance MonadIO m => MonadLoggerIO (StackT config m) where
+    askLoggerIO = getStickyLoggerFunc
+
+-- | Run a Stack action, using global options.
+runStackTGlobal :: (MonadIO m)
+                => Manager -> config -> GlobalOpts -> StackT config m a -> m a
+runStackTGlobal manager config GlobalOpts{..} =
+    runStackT manager globalLogLevel config globalTerminal (isJust globalReExecVersion)
+
+-- | Run a Stack action.
+runStackT :: (MonadIO m)
+          => Manager -> LogLevel -> config -> Bool -> Bool -> StackT config m a -> m a
+runStackT manager logLevel config terminal reExec m = do
+    ansiTerminal <- liftIO $ hSupportsANSI stderr
+    canUseUnicode <- liftIO getCanUseUnicode
+    withSticky
+        terminal
+        (\sticky ->
+              runReaderT
+                  (unStackT m)
+                  (Env config logLevel terminal ansiTerminal reExec manager sticky canUseUnicode))
+
+-- | Taken from GHC: determine if we should use Unicode syntax
+getCanUseUnicode :: IO Bool
+getCanUseUnicode = do
+    let enc = localeEncoding
+        str = "\x2018\x2019"
+        test = withCString enc str $ \cstr -> do
+            str' <- peekCString enc cstr
+            return (str == str')
+    test `catchIOError` \_ -> return False
+
+--------------------------------------------------------------------------------
+-- Logging only StackLoggingT monad transformer
+
+-- | Monadic environment for 'StackLoggingT'.
+data LoggingEnv = LoggingEnv
+    { lenvLogLevel :: !LogLevel
+    , lenvTerminal :: !Bool
+    , lenvAnsiTerminal :: !Bool
+    , lenvReExec :: !Bool
+    , lenvManager :: !Manager
+    , lenvSticky :: !Sticky
+    , lenvSupportsUnicode :: !Bool
+    }
+
+-- | The monad used for logging in the executable @stack@ before
+-- anything has been initialized.
+newtype StackLoggingT m a = StackLoggingT
+    { unStackLoggingT :: ReaderT LoggingEnv m a
+    } deriving (Functor,Applicative,Monad,MonadIO,MonadThrow,MonadReader LoggingEnv,MonadCatch,MonadMask,MonadTrans)
+
+deriving instance (MonadBase b m) => MonadBase b (StackLoggingT m)
+
+instance MonadBaseControl b m => MonadBaseControl b (StackLoggingT m) where
+    type StM (StackLoggingT m) a = ComposeSt StackLoggingT m a
+    liftBaseWith     = defaultLiftBaseWith
+    restoreM         = defaultRestoreM
+
+instance MonadTransControl StackLoggingT where
+    type StT StackLoggingT a = StT (ReaderT LoggingEnv) a
+    liftWith = defaultLiftWith StackLoggingT unStackLoggingT
+    restoreT = defaultRestoreT StackLoggingT
+
+-- | Takes the configured log level into account.
+instance (MonadIO m) => MonadLogger (StackLoggingT m) where
+    monadLoggerLog = stickyLoggerFunc
+
+instance HasSticky LoggingEnv where
+    getSticky = lenvSticky
+
+instance HasLogLevel LoggingEnv where
+    getLogLevel = lenvLogLevel
+
+instance HasHttpManager LoggingEnv where
+    getHttpManager = lenvManager
+
+instance HasTerminal LoggingEnv where
+    getTerminal = lenvTerminal
+    getAnsiTerminal = lenvAnsiTerminal
+
+instance HasReExec LoggingEnv where
+    getReExec = lenvReExec
+
+instance HasSupportsUnicode LoggingEnv where
+    getSupportsUnicode = lenvSupportsUnicode
+
+runInnerStackT :: (HasHttpManager r, HasLogLevel r, HasTerminal r, HasReExec r, MonadReader r m, MonadIO m)
+               => config -> StackT config IO a -> m a
+runInnerStackT config inner = do
+    manager <- asks getHttpManager
+    logLevel <- asks getLogLevel
+    terminal <- asks getTerminal
+    reExec <- asks getReExec
+    liftIO $ runStackT manager logLevel config terminal reExec inner
+
+runInnerStackLoggingT :: (HasHttpManager r, HasLogLevel r, HasTerminal r, HasReExec r, MonadReader r m, MonadIO m)
+                      => StackLoggingT IO a -> m a
+runInnerStackLoggingT inner = do
+    manager <- asks getHttpManager
+    logLevel <- asks getLogLevel
+    terminal <- asks getTerminal
+    reExec <- asks getReExec
+    liftIO $ runStackLoggingT manager logLevel terminal reExec inner
+
+-- | Run the logging monad, using global options.
+runStackLoggingTGlobal :: MonadIO m
+                       => Manager -> GlobalOpts -> StackLoggingT m a -> m a
+runStackLoggingTGlobal manager GlobalOpts{..} =
+    runStackLoggingT manager globalLogLevel globalTerminal (isJust globalReExecVersion)
+
+-- | Run the logging monad.
+runStackLoggingT :: MonadIO m
+                 => Manager -> LogLevel -> Bool -> Bool -> StackLoggingT m a -> m a
+runStackLoggingT manager logLevel terminal reExec m = do
+    ansiTerminal <- liftIO $ hSupportsANSI stderr
+    canUseUnicode <- liftIO getCanUseUnicode
+    withSticky
+        terminal
+        (\sticky ->
+              runReaderT
+                  (unStackLoggingT m)
+                  LoggingEnv
+                  { lenvLogLevel = logLevel
+                  , lenvManager = manager
+                  , lenvSticky = sticky
+                  , lenvTerminal = terminal
+                  , lenvAnsiTerminal = ansiTerminal
+                  , lenvReExec = reExec
+                  , lenvSupportsUnicode = canUseUnicode
+                  })
+
+-- | Convenience for getting a 'Manager'
+newTLSManager :: MonadIO m => m Manager
+newTLSManager = liftIO $ newManager tlsManagerSettings
+
+--------------------------------------------------------------------------------
+-- Logging functionality
+stickyLoggerFunc
+    :: (HasSticky r, HasLogLevel r, HasSupportsUnicode r, ToLogStr msg, MonadReader r m, MonadIO m)
+    => Loc -> LogSource -> LogLevel -> msg -> m ()
+stickyLoggerFunc loc src level msg = do
+    func <- getStickyLoggerFunc
+    liftIO $ func loc src level msg
+
+getStickyLoggerFunc
+    :: (HasSticky r, HasLogLevel r, HasSupportsUnicode r, ToLogStr msg, MonadReader r m)
+    => m (Loc -> LogSource -> LogLevel -> msg -> IO ())
+getStickyLoggerFunc = do
+    sticky <- asks getSticky
+    logLevel <- asks getLogLevel
+    supportsUnicode <- asks getSupportsUnicode
+    return $ stickyLoggerFuncImpl sticky logLevel supportsUnicode
+
+stickyLoggerFuncImpl
+    :: ToLogStr msg
+    => Sticky -> LogLevel -> Bool
+    -> (Loc -> LogSource -> LogLevel -> msg -> IO ())
+stickyLoggerFuncImpl (Sticky mref) maxLogLevel supportsUnicode loc src level msg =
+    case mref of
+        Nothing ->
+            loggerFunc
+                maxLogLevel
+                out
+                loc
+                src
+                (case level of
+                     LevelOther "sticky-done" -> LevelInfo
+                     LevelOther "sticky" -> LevelInfo
+                     _ -> level)
+                msg
+        Just ref -> do
+            sticky <- takeMVar ref
+            let backSpaceChar = '\8'
+                repeating = S8.replicate (maybe 0 T.length sticky)
+                clear = S8.hPutStr out
+                    (repeating backSpaceChar <>
+                     repeating ' ' <>
+                     repeating backSpaceChar)
+
+            -- Convert some GHC-generated Unicode characters as necessary
+            let msgText
+                    | supportsUnicode = msgTextRaw
+                    | otherwise = T.map replaceUnicode msgTextRaw
+
+            newState <-
+                case level of
+                    LevelOther "sticky-done" -> do
+                        clear
+                        T.hPutStrLn out msgText
+                        hFlush out
+                        return Nothing
+                    LevelOther "sticky" -> do
+                        clear
+                        T.hPutStr out msgText
+                        hFlush out
+                        return (Just msgText)
+                    _
+                      | level >= maxLogLevel -> do
+                          clear
+                          loggerFunc maxLogLevel out loc src level $ toLogStr msgText
+                          case sticky of
+                              Nothing ->
+                                  return Nothing
+                              Just line -> do
+                                  T.hPutStr out line >> hFlush out
+                                  return sticky
+                      | otherwise ->
+                          return sticky
+            putMVar ref newState
+  where
+    out = stderr
+    msgTextRaw = T.decodeUtf8With T.lenientDecode msgBytes
+    msgBytes = fromLogStr (toLogStr msg)
+
+-- | Replace Unicode characters with non-Unicode equivalents
+replaceUnicode :: Char -> Char
+replaceUnicode '\x2018' = '`'
+replaceUnicode '\x2019' = '\''
+replaceUnicode c = c
+
+-- | Logging function takes the log level into account.
+loggerFunc :: ToLogStr msg
+           => LogLevel -> Handle -> Loc -> Text -> LogLevel -> msg -> IO ()
+loggerFunc maxLogLevel outputChannel loc _src level msg =
+   when (level >= maxLogLevel)
+        (liftIO (do out <- getOutput
+                    T.hPutStrLn outputChannel out))
+  where getOutput =
+          do timestamp <- getTimestamp
+             l <- getLevel
+             lc <- getLoc
+             return (T.pack timestamp <> T.pack l <> T.decodeUtf8 (fromLogStr (toLogStr msg)) <> T.pack lc)
+          where getTimestamp
+                  | maxLogLevel <= LevelDebug =
+                    do now <- getZonedTime
+                       return (formatTime' now ++ ": ")
+                  | otherwise = return ""
+                  where
+                    formatTime' =
+                        take timestampLength . formatTime defaultTimeLocale "%F %T.%q"
+                getLevel
+                  | maxLogLevel <= LevelDebug =
+                    return ("[" ++
+                            map toLower (drop 5 (show level)) ++
+                            "] ")
+                  | otherwise = return ""
+                getLoc
+                  | maxLogLevel <= LevelDebug =
+                    return (" @(" ++ fileLocStr ++ ")")
+                  | otherwise = return ""
+                fileLocStr =
+                  loc_package loc ++
+                  ':' :
+                  loc_module loc ++
+                  ' ' :
+                  loc_filename loc ++
+                  ':' :
+                  line loc ++
+                  ':' :
+                  char loc
+                  where line = show . fst . loc_start
+                        char = show . snd . loc_start
+
+-- | The length of a timestamp in the format "YYYY-MM-DD hh:mm:ss.μμμμμμ".
+-- This definition is top-level in order to avoid multiple reevaluation at runtime.
+timestampLength :: Int
+timestampLength =
+  length (formatTime defaultTimeLocale "%F %T.000000" (UTCTime (ModifiedJulianDay 0) 0))
+
+-- | With a sticky state, do the thing.
+withSticky :: (MonadIO m)
+           => Bool -> (Sticky -> m b) -> m b
+withSticky terminal m =
+    if terminal
+       then do state <- liftIO (newMVar Nothing)
+               originalMode <- liftIO (hGetBuffering stdout)
+               liftIO (hSetBuffering stdout NoBuffering)
+               a <- m (Sticky (Just state))
+               state' <- liftIO (takeMVar state)
+               liftIO (when (isJust state') (S8.putStr "\n"))
+               liftIO (hSetBuffering stdout originalMode)
+               return a
+       else m (Sticky Nothing)
+
+-- | Write a "sticky" line to the terminal. Any subsequent lines will
+-- overwrite this one, and that same line will be repeated below
+-- again. In other words, the line sticks at the bottom of the output
+-- forever. Running this function again will replace the sticky line
+-- with a new sticky line. When you want to get rid of the sticky
+-- line, run 'logStickyDone'.
+--
+logSticky :: Q Exp
+logSticky =
+    logOther "sticky"
+
+-- | This will print out the given message with a newline and disable
+-- any further stickiness of the line until a new call to 'logSticky'
+-- happens.
+--
+-- It might be better at some point to have a 'runSticky' function
+-- that encompasses the logSticky->logStickyDone pairing.
+logStickyDone :: Q Exp
+logStickyDone =
+    logOther "sticky-done"
+{-# OPTIONS_GHC -fno-warn-orphans -Wwarn #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE OverloadedStrings #-}
+module Stack.StoreSpec where
+
+import           Control.Applicative
+import qualified Data.ByteString as BS
+import           Data.Containers (mapFromList, setFromList)
+import           Data.Int
+import           Data.Map (Map)
+import           Data.Sequences (fromList)
+import           Data.Set (Set)
+import           Data.Store.TH
+import           Data.Text (Text)
+import qualified Data.Vector.Unboxed as UV
+import           Data.Word
+import           Language.Haskell.TH
+import           Language.Haskell.TH.ReifyMany
+import           Prelude
+import           Stack.Types.Build
+import           Stack.Types.BuildPlan
+import           Stack.Types.PackageDump
+import           Stack.Types.PackageIndex
+import           Test.Hspec
+import           Test.SmallCheck.Series
+
+-- NOTE: these were copied from Data.Store. Should probably be moved to
+-- smallcheck.
+
+instance (Monad m, Serial m k, Serial m a, Ord k) => Serial m (Map k a) where
+    series = fmap mapFromList series
+
+instance Monad m => Serial m Text where
+    series = fmap fromList series
+
+instance (Monad m, Serial m a, UV.Unbox a) => Serial m (UV.Vector a) where
+    series = fmap fromList series
+
+instance Monad m => Serial m BS.ByteString where
+    series = fmap BS.pack series
+
+instance (Monad m, Serial m a, Ord a) => Serial m (Set a) where
+    series = fmap setFromList series
+
+addMinAndMaxBounds :: forall a. (Bounded a, Eq a) => [a] -> [a]
+addMinAndMaxBounds xs =
+    (if (minBound :: a) `notElem` xs then [minBound] else []) ++
+    (if (maxBound :: a) `notElem` xs && (maxBound :: a) /= minBound then maxBound : xs else xs)
+
+$(do let ns = [ ''Int64, ''Word64, ''Word, ''Word8
+              ]
+         f n = [d| instance Monad m => Serial m $(conT n) where
+                      series = generate (\_ -> addMinAndMaxBounds [0, 1]) |]
+     concat <$> mapM f ns)
+
+$(do let tys = [ ''InstalledCacheInner
+               , ''PackageCacheMap
+               , ''MiniBuildPlan
+               , ''BuildCache
+               , ''ConfigCache
+               ]
+     ns <- reifyManyWithoutInstances ''Serial tys (`notElem` [''UV.Vector])
+     let f n = [d| instance Monad m => Serial m $(conT n) |]
+     concat <$> mapM f ns)
+
+verbose :: Bool
+verbose = False
+
+spec :: Spec
+spec = do
+    describe "Roundtrips binary formats" $ do
+        $(smallcheckManyStore False 6
+            [ [t| InstalledCacheInner |]
+            , [t| PackageCacheMap |]
+            , [t| BuildCache |]
+            ])
+        -- Blows up with > 5
+        $(smallcheckManyStore False 5
+            [ [t| MiniBuildPlan |]
+            ])
+        -- Blows up with > 4
+        $(smallcheckManyStore False 4
+            [ [t| ConfigCache |]
+            ])
+{-# LANGUAGE DataKinds          #-}
+{-# LANGUAGE GADTs              #-}
+{-# LANGUAGE KindSignatures     #-}
+{-# LANGUAGE OverloadedStrings  #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TupleSections      #-}
+{-# LANGUAGE ViewPatterns       #-}
+-- | Parsing command line targets
+module Stack.Build.Target
+    ( -- * Types
+      ComponentName
+    , UnresolvedComponent (..)
+    , RawTarget (..)
+    , LocalPackageView (..)
+    , SimpleTarget (..)
+    , NeedTargets (..)
+      -- * Parsers
+    , parseRawTarget
+    , parseTargets
+    ) where
+
+import           Control.Applicative
+import           Control.Arrow (second)
+import           Control.Monad.Catch (MonadCatch, throwM)
+import           Control.Monad.IO.Class
+import           Data.Either (partitionEithers)
+import           Data.Foldable
+import           Data.List.Extra (groupSort)
+import           Data.List.NonEmpty (NonEmpty((:|)))
+import qualified Data.List.NonEmpty as NonEmpty
+import           Data.Map (Map)
+import qualified Data.Map as Map
+import           Data.Maybe (mapMaybe)
+import           Data.Set (Set)
+import qualified Data.Set as Set
+import           Data.Text (Text)
+import qualified Data.Text as T
+import           Path
+import           Path.Extra (rejectMissingDir)
+import           Path.IO
+import           Prelude hiding (concat, concatMap) -- Fix redundant import warnings
+import           Stack.Types.PackageIdentifier
+import           Stack.Types.PackageName
+import           Stack.Types.Version
+import           Stack.Types.Config
+import           Stack.Types.Build
+import           Stack.Types.Package
+
+-- | The name of a component, which applies to executables, test suites, and benchmarks
+type ComponentName = Text
+
+newtype RawInput = RawInput { unRawInput :: Text }
+
+-- | Either a fully resolved component, or a component name that could be
+-- either an executable, test, or benchmark
+data UnresolvedComponent
+    = ResolvedComponent !NamedComponent
+    | UnresolvedComponent !ComponentName
+    deriving (Show, Eq, Ord)
+
+-- | Raw command line input, without checking against any databases or list of
+-- locals. Does not deal with directories
+data RawTarget (a :: RawTargetType) where
+    RTPackageComponent :: !PackageName -> !UnresolvedComponent -> RawTarget a
+    RTComponent :: !ComponentName -> RawTarget a
+    RTPackage :: !PackageName -> RawTarget a
+    RTPackageIdentifier :: !PackageIdentifier -> RawTarget 'HasIdents
+
+deriving instance Show (RawTarget a)
+deriving instance Eq (RawTarget a)
+deriving instance Ord (RawTarget a)
+
+data RawTargetType = HasIdents | NoIdents
+
+-- | If this function returns @Nothing@, the input should be treated as a
+-- directory.
+parseRawTarget :: Text -> Maybe (RawTarget 'HasIdents)
+parseRawTarget t =
+        (RTPackageIdentifier <$> parsePackageIdentifierFromString s)
+    <|> (RTPackage <$> parsePackageNameFromString s)
+    <|> (RTComponent <$> T.stripPrefix ":" t)
+    <|> parsePackageComponent
+  where
+    s = T.unpack t
+
+    parsePackageComponent =
+        case T.splitOn ":" t of
+            [pname, "lib"]
+                | Just pname' <- parsePackageNameFromString (T.unpack pname) ->
+                    Just $ RTPackageComponent pname' $ ResolvedComponent CLib
+            [pname, cname]
+                | Just pname' <- parsePackageNameFromString (T.unpack pname) ->
+                    Just $ RTPackageComponent pname' $ UnresolvedComponent cname
+            [pname, typ, cname]
+                | Just pname' <- parsePackageNameFromString (T.unpack pname)
+                , Just wrapper <- parseCompType typ ->
+                    Just $ RTPackageComponent pname' $ ResolvedComponent $ wrapper cname
+            _ -> Nothing
+
+    parseCompType t' =
+        case t' of
+            "exe" -> Just CExe
+            "test" -> Just CTest
+            "bench" -> Just CBench
+            _ -> Nothing
+
+-- | A view of a local package needed for resolving components
+data LocalPackageView = LocalPackageView
+    { lpvVersion    :: !Version
+    , lpvRoot       :: !(Path Abs Dir)
+    , lpvCabalFP    :: !(Path Abs File)
+    , lpvComponents :: !(Set NamedComponent)
+    , lpvExtraDep   :: !TreatLikeExtraDep
+    }
+
+-- | Same as @parseRawTarget@, but also takes directories into account.
+parseRawTargetDirs :: (MonadIO m, MonadCatch m)
+                   => Path Abs Dir -- ^ current directory
+                   -> Map PackageName LocalPackageView
+                   -> Text
+                   -> m (Either Text [(RawInput, RawTarget 'HasIdents)])
+parseRawTargetDirs root locals t =
+    case parseRawTarget t of
+        Just rt -> return $ Right [(ri, rt)]
+        Nothing -> do
+            mdir <- forgivingAbsence (resolveDir root (T.unpack t))
+              >>= rejectMissingDir
+            case mdir of
+                Nothing -> return $ Left $ "Directory not found: " `T.append` t
+                Just dir ->
+                    case mapMaybe (childOf dir) $ Map.toList locals of
+                        [] -> return $ Left $
+                            "No local directories found as children of " `T.append`
+                            t
+                        names -> return $ Right $ map ((ri, ) . RTPackage) names
+  where
+    ri = RawInput t
+
+    childOf dir (name, lpv) =
+        if (dir == lpvRoot lpv || isParentOf dir (lpvRoot lpv)) && not (lpvExtraDep lpv)
+            then Just name
+            else Nothing
+
+data SimpleTarget
+    = STUnknown
+    | STNonLocal
+    | STLocalComps !(Set NamedComponent)
+    | STLocalAll
+    deriving (Show, Eq, Ord)
+
+resolveIdents :: Map PackageName Version -- ^ snapshot
+              -> Map PackageName Version -- ^ extra deps
+              -> Map PackageName LocalPackageView
+              -> (RawInput, RawTarget 'HasIdents)
+              -> Either Text ((RawInput, RawTarget 'NoIdents), Map PackageName Version)
+resolveIdents _ _ _ (ri, RTPackageComponent x y) = Right ((ri, RTPackageComponent x y), Map.empty)
+resolveIdents _ _ _ (ri, RTComponent x) = Right ((ri, RTComponent x), Map.empty)
+resolveIdents _ _ _ (ri, RTPackage x) = Right ((ri, RTPackage x), Map.empty)
+resolveIdents snap extras locals (ri, RTPackageIdentifier (PackageIdentifier name version)) =
+    fmap ((ri, RTPackage name), ) newExtras
+  where
+    newExtras =
+        case (Map.lookup name locals, mfound) of
+            -- Error if it matches a local package, pkg idents not
+            -- supported for local.
+            (Just _, _) -> Left $ T.concat
+                [ packageNameText name
+                , " target has a specific version number, but it is a local package."
+                , "\nTo avoid confusion, we will not install the specified version or build the local one."
+                , "\nTo build the local package, specify the target without an explicit version."
+                ]
+            -- If the found version matches, no need for an extra-dep.
+            (_, Just foundVersion) | foundVersion == version -> Right Map.empty
+            -- Otherwise, if there is no specified version or a
+            -- mismatch, add an extra-dep.
+            _ -> Right $ Map.singleton name version
+    mfound = asum (map (Map.lookup name) [extras, snap])
+
+resolveRawTarget :: Map PackageName Version -- ^ snapshot
+                 -> Map PackageName Version -- ^ extra deps
+                 -> Map PackageName LocalPackageView
+                 -> (RawInput, RawTarget 'NoIdents)
+                 -> Either Text (PackageName, (RawInput, SimpleTarget))
+resolveRawTarget snap extras locals (ri, rt) =
+    go rt
+  where
+    go (RTPackageComponent name ucomp) =
+        case Map.lookup name locals of
+            Nothing -> Left $ T.pack $ "Unknown local package: " ++ packageNameString name
+            Just lpv ->
+                case ucomp of
+                    ResolvedComponent comp
+                        | comp `Set.member` lpvComponents lpv ->
+                            Right (name, (ri, STLocalComps $ Set.singleton comp))
+                        | otherwise -> Left $ T.pack $ concat
+                            [ "Component "
+                            , show comp
+                            , " does not exist in package "
+                            , packageNameString name
+                            ]
+                    UnresolvedComponent comp ->
+                        case filter (isCompNamed comp) $ Set.toList $ lpvComponents lpv of
+                            [] -> Left $ T.concat
+                                [ "Component "
+                                , comp
+                                , " does not exist in package "
+                                , T.pack $ packageNameString name
+                                ]
+                            [x] -> Right (name, (ri, STLocalComps $ Set.singleton x))
+                            matches -> Left $ T.concat
+                                [ "Ambiguous component name "
+                                , comp
+                                , " for package "
+                                , T.pack $ packageNameString name
+                                , ": "
+                                , T.pack $ show matches
+                                ]
+    go (RTComponent cname) =
+        let allPairs = concatMap
+                (\(name, lpv) -> map (name,) $ Set.toList $ lpvComponents lpv)
+                (Map.toList locals)
+         in case filter (isCompNamed cname . snd) allPairs of
+                [] -> Left $ "Could not find a component named " `T.append` cname
+                [(name, comp)] ->
+                    Right (name, (ri, STLocalComps $ Set.singleton comp))
+                matches -> Left $ T.concat
+                    [ "Ambiugous component name "
+                    , cname
+                    , ", matches: "
+                    , T.pack $ show matches
+                    ]
+
+    go (RTPackage name) =
+        case Map.lookup name locals of
+            Just _lpv -> Right (name, (ri, STLocalAll))
+            Nothing ->
+                case Map.lookup name extras of
+                    Just _ -> Right (name, (ri, STNonLocal))
+                    Nothing ->
+                        case Map.lookup name snap of
+                            Just _ -> Right (name, (ri, STNonLocal))
+                            Nothing -> Right (name, (ri, STUnknown))
+
+isCompNamed :: Text -> NamedComponent -> Bool
+isCompNamed _ CLib = False
+isCompNamed t1 (CExe t2) = t1 == t2
+isCompNamed t1 (CTest t2) = t1 == t2
+isCompNamed t1 (CBench t2) = t1 == t2
+
+simplifyTargets :: [(PackageName, (RawInput, SimpleTarget))]
+                -> ([Text], Map PackageName SimpleTarget)
+simplifyTargets =
+    foldMap go . collect
+  where
+    go :: (PackageName, NonEmpty (RawInput, SimpleTarget))
+       -> ([Text], Map PackageName SimpleTarget)
+    go (name, (_, st) :| []) = ([], Map.singleton name st)
+    go (name, pairs) =
+        case partitionEithers $ map (getLocalComp . snd) (NonEmpty.toList pairs) of
+            ([], comps) -> ([], Map.singleton name $ STLocalComps $ Set.unions comps)
+            _ ->
+                let err = T.pack $ concat
+                        [ "Overlapping targets provided for package "
+                        , packageNameString name
+                        , ": "
+                        , show $ map (unRawInput . fst) (NonEmpty.toList pairs)
+                        ]
+                 in ([err], Map.empty)
+
+    collect :: Ord a => [(a, b)] -> [(a, NonEmpty b)]
+    collect = map (second NonEmpty.fromList) . groupSort
+
+    getLocalComp (STLocalComps comps) = Right comps
+    getLocalComp _ = Left ()
+
+-- | Need targets, e.g. `stack build` or allow none?
+data NeedTargets
+    = NeedTargets
+    | AllowNoTargets
+
+parseTargets :: (MonadCatch m, MonadIO m)
+             => NeedTargets -- ^ need at least one target
+             -> Bool -- ^ using implicit global project?
+             -> Map PackageName Version -- ^ snapshot
+             -> Map PackageName Version -- ^ extra deps
+             -> Map PackageName LocalPackageView
+             -> Path Abs Dir -- ^ current directory
+             -> [Text] -- ^ command line targets
+             -> m (Map PackageName Version, Map PackageName SimpleTarget)
+parseTargets needTargets implicitGlobal snap extras locals currDir textTargets' = do
+    let nonExtraDeps = Map.keys $ Map.filter (not . lpvExtraDep) locals
+        textTargets =
+            if null textTargets'
+                then map (T.pack . packageNameString) nonExtraDeps
+                else textTargets'
+    erawTargets <- mapM (parseRawTargetDirs currDir locals) textTargets
+
+    let (errs1, rawTargets) = partitionEithers erawTargets
+        (errs2, unzip -> (rawTargets', newExtras)) = partitionEithers $
+            map (resolveIdents snap extras locals) $ concat rawTargets
+        (errs3, targetTypes) = partitionEithers $
+            map (resolveRawTarget snap extras locals) rawTargets'
+        (errs4, targets) = simplifyTargets targetTypes
+        errs = concat [errs1, errs2, errs3, errs4]
+
+    if null errs
+        then if Map.null targets
+                 then case needTargets of
+                        AllowNoTargets ->
+                            return (Map.empty, Map.empty)
+                        NeedTargets
+                            | null textTargets' && implicitGlobal -> throwM $ TargetParseException
+                                ["The specified targets matched no packages.\nPerhaps you need to run 'stack init'?"]
+                            | null textTargets' && null nonExtraDeps -> throwM $ TargetParseException
+                                ["The project contains no local packages (packages not marked with 'extra-dep')"]
+                            | otherwise -> throwM $ TargetParseException
+                                ["The specified targets matched no packages"]
+                 else return (Map.unions newExtras, targets)
+        else throwM $ TargetParseException errs
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell   #-}
+module Stack.Build.TargetSpec (main, spec) where
+
+import qualified Data.Text           as T
+import           Stack.Build.Target
+import           Stack.Types.PackageIdentifier
+import           Stack.Types.PackageName
+import           Stack.Types.Version
+import           Stack.Types.Package
+import           Test.Hspec
+
+main :: IO ()
+main = hspec spec
+
+spec :: Spec
+spec = do
+    describe "parseRawTarget" $ do
+        let test s e = it s $ parseRawTarget (T.pack s) `shouldBe` e
+        test "foobar" $ Just $ RTPackage $(mkPackageName "foobar")
+        test "foobar-1.2.3" $ Just $ RTPackageIdentifier $ PackageIdentifier
+            $(mkPackageName "foobar") $(mkVersion "1.2.3")
+        test "./foobar" Nothing
+        test "foobar/" Nothing
+        test "/foobar" Nothing
+        test ":some-exe" $ Just $ RTComponent "some-exe"
+        test "foobar:some-exe" $ Just $ RTPackageComponent $(mkPackageName "foobar") $ UnresolvedComponent "some-exe"
+        test "foobar:exe:some-exe" $ Just $ RTPackageComponent $(mkPackageName "foobar")
+            $ ResolvedComponent $ CExe "some-exe"
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+
+-- | Template name handling.
+
+module Stack.Types.TemplateName where
+
+import           Control.Error.Safe (justErr)
+import           Control.Applicative
+import           Data.Aeson.Extended (FromJSON, withText, parseJSON)
+import           Data.Aeson.Types (typeMismatch)
+import           Data.Foldable (asum)
+import           Data.Monoid
+import           Data.Text (Text)
+import qualified Data.Text as T
+import           Data.Yaml (Value(Object), (.:?))
+import           Language.Haskell.TH
+import           Network.HTTP.Client (parseRequest)
+import qualified Options.Applicative as O
+import           Path
+import           Path.Internal
+import           Prelude
+
+-- | A template name.
+data TemplateName = TemplateName !Text !TemplatePath
+  deriving (Ord,Eq,Show)
+
+data TemplatePath = AbsPath (Path Abs File)
+                  -- ^ an absolute path on the filesystem
+                  | RelPath (Path Rel File)
+                  -- ^ a relative path on the filesystem, or relative to
+                  -- the template repository
+                  | UrlPath String
+                  -- ^ a full URL
+  deriving (Eq, Ord, Show)
+
+instance FromJSON TemplateName where
+    parseJSON = withText "TemplateName" $
+        either fail return . parseTemplateNameFromString . T.unpack
+
+data TemplateInfo = TemplateInfo
+  { author      :: Maybe Text
+  , description :: Maybe Text }
+  deriving (Eq, Ord, Show)
+
+instance FromJSON TemplateInfo where
+  parseJSON (Object v) = TemplateInfo <$> v .:? "author" <*> v .:? "description"
+  parseJSON invalid = typeMismatch "Template Info" invalid
+
+-- | An argument which accepts a template name of the format
+-- @foo.hsfiles@ or @foo@, ultimately normalized to @foo@.
+templateNameArgument :: O.Mod O.ArgumentFields TemplateName
+                     -> O.Parser TemplateName
+templateNameArgument =
+    O.argument
+        (do string <- O.str
+            either O.readerError return (parseTemplateNameFromString string))
+
+-- | An argument which accepts a @key:value@ pair for specifying parameters.
+templateParamArgument :: O.Mod O.OptionFields (Text,Text)
+                      -> O.Parser (Text,Text)
+templateParamArgument =
+    O.option
+        (do string <- O.str
+            either O.readerError return (parsePair string))
+  where
+    parsePair :: String -> Either String (Text, Text)
+    parsePair s =
+        case break (==':') s of
+            (key,':':value@(_:_)) -> Right (T.pack key, T.pack value)
+            _ -> Left ("Expected key:value format for argument: " <> s)
+
+-- | Parse a template name from a string.
+parseTemplateNameFromString :: String -> Either String TemplateName
+parseTemplateNameFromString fname =
+    case T.stripSuffix ".hsfiles" (T.pack fname) of
+        Nothing -> parseValidFile (T.pack fname) (fname <> ".hsfiles") fname
+        Just prefix -> parseValidFile prefix fname fname
+  where
+    parseValidFile prefix hsf orig = justErr expected
+                                           $ asum (validParses prefix hsf orig)
+    validParses prefix hsf orig =
+        -- NOTE: order is important
+        [ TemplateName (T.pack orig) . UrlPath <$> (parseRequest orig *> Just orig)
+        , TemplateName prefix        . AbsPath <$> parseAbsFile hsf
+        , TemplateName prefix        . RelPath <$> parseRelFile hsf
+        ]
+    expected = "Expected a template like: foo or foo.hsfiles or\
+               \ https://example.com/foo.hsfiles"
+
+-- | Make a template name.
+mkTemplateName :: String -> Q Exp
+mkTemplateName s =
+    case parseTemplateNameFromString s of
+        Left{} -> error ("Invalid template name: " ++ show s)
+        Right (TemplateName (T.unpack -> prefix) p) ->
+            [|TemplateName (T.pack prefix) $(pn)|]
+            where pn =
+                      case p of
+                          AbsPath (Path fp) -> [|AbsPath (Path fp)|]
+                          RelPath (Path fp) -> [|RelPath (Path fp)|]
+                          UrlPath fp -> [|UrlPath fp|]
+
+-- | Get a text representation of the template name.
+templateName :: TemplateName -> Text
+templateName (TemplateName prefix _) = prefix
+
+-- | Get the path of the template.
+templatePath :: TemplateName -> TemplatePath
+templatePath (TemplateName _ fp) = fp
+import Test.Hspec (hspec)
+import Spec (spec)
+
+main :: IO ()
+main = hspec spec
+-- | Version of Unlisted with different export that causes failure to compile.
+module Unlisted where
+
+fooRenamed :: String
+fooRenamed = "foo"
+module Unlisted where
+
+foo :: String
+foo = "foo"
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
+module Stack.Untar.UntarSpec where
+
+import Data.List (sort)
+import Path
+import Path.IO (removeDirRecur)
+import qualified System.FilePath as FP
+import Stack.Fetch (untar)
+import Test.Hspec
+
+spec :: Spec
+spec = do
+    describe "Untarring ignores strange entries" $
+      mapM_ testTarFile tarFiles
+  where
+    -- XXX tests are run in the project root folder, but data files are next to
+    -- this source data.
+    currentFolder = $(mkRelDir $ "src" FP.</> "test" FP.</> "Stack" FP.</> "Untar")
+
+    -- Pairs test tarball names + list of unexpected entries contained: for each
+    -- entry, a tar pathname + description.
+    tarFilesBase = [ ("test1", [])
+                   , ("test2", [ ("bar", "named pipe")
+                               , ("devB", "block device")
+                               , ("devC", "character device")])]
+    -- Prepend tarball name to tar pathnames:
+    tarFiles =
+      [ (name,
+         [ (name FP.</> entryName, d)
+         | (entryName, d) <- entries])
+      | (name, entries) <- tarFilesBase ]
+
+    testTarFile (name, expected) =
+      it ("works on test " ++ name) $
+        getEntries name `shouldReturn` sort expected
+
+    getEntries name = do
+      tarballName <- parseRelFile $ name ++ ".tar.gz"
+      expectedTarFolder <- parseRelDir name
+
+      entries <- untar (currentFolder </> tarballName) expectedTarFolder currentFolder
+      removeDirRecur $ currentFolder </> expectedTarFolder
+      return $ sort entries
+{-# LANGUAGE FlexibleContexts      #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE TemplateHaskell       #-}
+module Stack.Upgrade (upgrade) where
+
+import           Control.Monad               (when)
+import           Control.Monad.Catch
+import           Control.Monad.IO.Class
+import           Control.Monad.Logger
+import           Control.Monad.Reader        (MonadReader)
+import           Control.Monad.Trans.Control
+import           Data.Foldable               (forM_)
+import qualified Data.Map                    as Map
+import           Data.Maybe                  (isNothing)
+import           Data.Monoid.Extra
+import qualified Data.Text as T
+import           Lens.Micro                  (set)
+import           Network.HTTP.Client.Conduit (HasHttpManager)
+import           Path
+import           Path.IO
+import qualified Paths_stack as Paths
+import           Stack.Build
+import           Stack.Config
+import           Stack.Fetch
+import           Stack.PackageIndex
+import           Stack.Setup
+import           Stack.Types.PackageIdentifier
+import           Stack.Types.PackageName
+import           Stack.Types.Version
+import           Stack.Types.Config
+import           Stack.Types.Internal
+import           Stack.Types.StackT
+import           System.Process              (readProcess)
+import           System.Process.Run
+
+upgrade :: (MonadIO m, MonadMask m, MonadReader env m, HasConfig env, HasHttpManager env, MonadLogger m, HasTerminal env, HasReExec env, HasLogLevel env, MonadBaseControl IO m)
+        => ConfigMonoid
+        -> Maybe String -- ^ git repository to use
+        -> Maybe AbstractResolver
+        -> Maybe String -- ^ git hash at time of building, if known
+        -> m ()
+upgrade gConfigMonoid gitRepo mresolver builtHash =
+  withSystemTempDir "stack-upgrade" $ \tmp -> do
+    menv <- getMinimalEnvOverride
+    mdir <- case gitRepo of
+      Just repo -> do
+        remote <- liftIO $ readProcess "git" ["ls-remote", repo, "master"] []
+        let latestCommit = head . words $ remote
+        when (isNothing builtHash) $
+            $logWarn $ "Information about the commit this version of stack was "
+                    <> "built from is not available due to how it was built. "
+                    <> "Will continue by assuming an upgrade is needed "
+                    <> "because we have no information to the contrary."
+        if builtHash == Just latestCommit
+            then do
+                $logInfo "Already up-to-date, no upgrade required"
+                return Nothing
+            else do
+                $logInfo "Cloning stack"
+                -- NOTE: "--recursive" was added after v1.0.0 (and before the
+                -- next release).  This means that we can't use submodules in
+                -- the stack repo until we're comfortable with "stack upgrade
+                -- --git" not working for earlier versions.
+                let args = [ "clone", repo , "stack", "--depth", "1", "--recursive"]
+                runCmd (Cmd (Just tmp) "git" menv args) Nothing
+                return $ Just $ tmp </> $(mkRelDir "stack")
+      Nothing -> do
+        updateAllIndices menv
+        caches <- getPackageCaches
+        let latest = Map.fromListWith max
+                   $ map toTuple
+                   $ Map.keys
+
+                   -- Mistaken upload to Hackage, just ignore it
+                   $ Map.delete (PackageIdentifier
+                        $(mkPackageName "stack")
+                        $(mkVersion "9.9.9"))
+
+                     caches
+        case Map.lookup $(mkPackageName "stack") latest of
+            Nothing -> error "No stack found in package indices"
+            Just version | version <= fromCabalVersion Paths.version -> do
+                $logInfo "Already at latest version, no upgrade required"
+                return Nothing
+            Just version -> do
+                let ident = PackageIdentifier $(mkPackageName "stack") version
+                paths <- unpackPackageIdents menv tmp Nothing
+                    -- accept latest cabal revision by not supplying a Git SHA
+                    $ Map.singleton ident Nothing
+                case Map.lookup ident paths of
+                    Nothing -> error "Stack.Upgrade.upgrade: invariant violated, unpacked directory not found"
+                    Just path -> return $ Just path
+
+    forM_ mdir $ \dir -> do
+        lc <- loadConfig
+            gConfigMonoid
+            mresolver
+            (Just $ dir </> $(mkRelFile "stack.yaml"))
+        bconfig <- lcLoadBuildConfig lc Nothing
+        envConfig1 <- runInnerStackT bconfig $ setupEnv $ Just $
+            "Try rerunning with --install-ghc to install the correct GHC into " <>
+            T.pack (toFilePath (configLocalPrograms (getConfig bconfig)))
+        runInnerStackT (set (envConfigBuildOpts.buildOptsInstallExes) True envConfig1) $
+            build (const $ return ()) Nothing defaultBuildOptsCLI
+                { boptsCLITargets = ["stack"]
+                }
+{-# LANGUAGE DeriveDataTypeable  #-}
+{-# LANGUAGE OverloadedStrings   #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+-- | Provide ability to upload tarballs to Hackage.
+module Stack.Upload
+    ( -- * Upload
+      nopUploader
+    , mkUploader
+    , Uploader
+    , upload
+    , uploadBytes
+    , UploadSettings
+    , defaultUploadSettings
+    , setUploadUrl
+    , setGetManager
+    , setCredsSource
+    , setSaveCreds
+      -- * Credentials
+    , HackageCreds
+    , loadCreds
+    , saveCreds
+    , FromFile
+      -- ** Credentials source
+    , HackageCredsSource
+    , fromAnywhere
+    , fromPrompt
+    , fromFile
+    , fromMemory
+    ) where
+
+import           Control.Applicative
+import           Control.Exception                     (bracket)
+import qualified Control.Exception                     as E
+import           Control.Monad                         (when, unless)
+import           Data.Aeson                            (FromJSON (..),
+                                                        ToJSON (..),
+                                                        eitherDecode', encode,
+                                                        object, withObject,
+                                                        (.:), (.=))
+import qualified Data.ByteString.Char8                 as S
+import qualified Data.ByteString.Lazy                  as L
+import           Data.Text                             (Text)
+import qualified Data.Text                             as T
+import           Data.Text.Encoding                    (encodeUtf8)
+import qualified Data.Text.IO                          as TIO
+import           Data.Typeable                         (Typeable)
+import           Network.HTTP.Client                   (BodyReader, Manager,
+                                                        Response,
+                                                        RequestBody(RequestBodyLBS),
+                                                        applyBasicAuth, brRead,
+                                                        newManager,
+                                                        parseRequest,
+                                                        requestHeaders,
+                                                        responseBody,
+                                                        responseStatus,
+                                                        withResponse)
+import           Network.HTTP.Client.MultipartFormData (formDataBody, partFileRequestBody)
+import           Network.HTTP.Client.TLS               (tlsManagerSettings)
+import           Network.HTTP.Types                    (statusCode)
+import           Path                                  (toFilePath)
+import           Prelude -- Fix redundant import warnings
+import           Stack.Types.Config
+import           System.Directory                      (createDirectoryIfMissing,
+                                                        removeFile)
+import           System.FilePath                       ((</>), takeFileName)
+import           System.IO                             (hFlush, hGetEcho, hSetEcho,
+                                                        stdin, stdout)
+
+-- | Username and password to log into Hackage.
+--
+-- Since 0.1.0.0
+data HackageCreds = HackageCreds
+    { hcUsername :: !Text
+    , hcPassword :: !Text
+    }
+    deriving Show
+
+instance ToJSON HackageCreds where
+    toJSON (HackageCreds u p) = object
+        [ "username" .= u
+        , "password" .= p
+        ]
+instance FromJSON HackageCreds where
+    parseJSON = withObject "HackageCreds" $ \o -> HackageCreds
+        <$> o .: "username"
+        <*> o .: "password"
+
+-- | A source for getting Hackage credentials.
+--
+-- Since 0.1.0.0
+newtype HackageCredsSource = HackageCredsSource
+    { getCreds :: IO (HackageCreds, FromFile)
+    }
+
+-- | Whether the Hackage credentials were loaded from a file.
+--
+-- This information is useful since, typically, you only want to save the
+-- credentials to a file if it wasn't already loaded from there.
+--
+-- Since 0.1.0.0
+type FromFile = Bool
+
+-- | Load Hackage credentials from the given source.
+--
+-- Since 0.1.0.0
+loadCreds :: HackageCredsSource -> IO (HackageCreds, FromFile)
+loadCreds = getCreds
+
+-- | Save the given credentials to the credentials file.
+--
+-- Since 0.1.0.0
+saveCreds :: Config -> HackageCreds -> IO ()
+saveCreds config creds = do
+    fp <- credsFile config
+    L.writeFile fp $ encode creds
+
+-- | Load the Hackage credentials from the prompt, asking the user to type them
+-- in.
+--
+-- Since 0.1.0.0
+fromPrompt :: HackageCredsSource
+fromPrompt = HackageCredsSource $ do
+    putStr "Hackage username: "
+    hFlush stdout
+    username <- TIO.getLine
+    password <- promptPassword
+    return (HackageCreds
+        { hcUsername = username
+        , hcPassword = password
+        }, False)
+
+credsFile :: Config -> IO FilePath
+credsFile config = do
+    let dir = toFilePath (configStackRoot config) </> "upload"
+    createDirectoryIfMissing True dir
+    return $ dir </> "credentials.json"
+
+-- | Load the Hackage credentials from the JSON config file.
+--
+-- Since 0.1.0.0
+fromFile :: Config -> HackageCredsSource
+fromFile config = HackageCredsSource $ do
+    fp <- credsFile config
+    lbs <- L.readFile fp
+    case eitherDecode' lbs of
+        Left e -> E.throwIO $ Couldn'tParseJSON fp e
+        Right creds -> return (creds, True)
+
+-- | Load the Hackage credentials from the given arguments.
+--
+-- Since 0.1.0.0
+fromMemory :: Text -> Text -> HackageCredsSource
+fromMemory u p = HackageCredsSource $ return (HackageCreds
+    { hcUsername = u
+    , hcPassword = p
+    }, False)
+
+data HackageCredsExceptions = Couldn'tParseJSON FilePath String
+    deriving (Show, Typeable)
+instance E.Exception HackageCredsExceptions
+
+-- | Try to load the credentials from the config file. If that fails, ask the
+-- user to enter them.
+--
+-- Since 0.1.0.0
+fromAnywhere :: Config -> HackageCredsSource
+fromAnywhere config = HackageCredsSource $
+    getCreds (fromFile config) `E.catches`
+        [ E.Handler $ \(_ :: E.IOException) -> getCreds fromPrompt
+        , E.Handler $ \(_ :: HackageCredsExceptions) -> getCreds fromPrompt
+        ]
+
+-- | Lifted from cabal-install, Distribution.Client.Upload
+promptPassword :: IO Text
+promptPassword = do
+  putStr "Hackage password: "
+  hFlush stdout
+  -- save/restore the terminal echoing status
+  passwd <- bracket (hGetEcho stdin) (hSetEcho stdin) $ \_ -> do
+    hSetEcho stdin False  -- no echoing for entering the password
+    fmap T.pack getLine
+  putStrLn ""
+  return passwd
+
+nopUploader :: Config -> UploadSettings -> IO Uploader
+nopUploader _ _ = return (Uploader nop)
+  where nop :: String -> L.ByteString -> IO ()
+        nop _ _ = return ()
+
+-- | Turn the given settings into an @Uploader@.
+--
+-- Since 0.1.0.0
+mkUploader :: Config -> UploadSettings -> IO Uploader
+mkUploader config us = do
+    manager <- usGetManager us
+    (creds, fromFile') <- loadCreds $ usCredsSource us config
+    when (not fromFile' && usSaveCreds us) $ saveCreds config creds
+    req0 <- parseRequest $ usUploadUrl us
+    let req1 = req0
+            { requestHeaders = [("Accept", "text/plain")]
+            }
+    return Uploader
+        { upload_ = \tarName bytes -> do
+            let formData = [partFileRequestBody "package" tarName (RequestBodyLBS bytes)]
+            req2 <- formDataBody formData req1
+            let req3 = applyBasicAuth
+                    (encodeUtf8 $ hcUsername creds)
+                    (encodeUtf8 $ hcPassword creds)
+                    req2
+            putStr $ "Uploading " ++ tarName ++ "... "
+            hFlush stdout
+            withResponse req3 manager $ \res ->
+                case statusCode $ responseStatus res of
+                    200 -> putStrLn "done!"
+                    401 -> do
+                        putStrLn "authentication failure"
+                        cfp <- credsFile config
+                        handleIO (const $ return ()) (removeFile cfp)
+                        error "Authentication failure uploading to server"
+                    403 -> do
+                        putStrLn "forbidden upload"
+                        putStrLn "Usually means: you've already uploaded this package/version combination"
+                        putStrLn "Ignoring error and continuing, full message from Hackage below:\n"
+                        printBody res
+                    503 -> do
+                        putStrLn "service unavailable"
+                        putStrLn "This error some times gets sent even though the upload succeeded"
+                        putStrLn "Check on Hackage to see if your pacakge is present"
+                        printBody res
+                    code -> do
+                        putStrLn $ "unhandled status code: " ++ show code
+                        printBody res
+                        error $ "Upload failed on " ++ tarName
+        }
+
+printBody :: Response BodyReader -> IO ()
+printBody res =
+    loop
+  where
+    loop = do
+        bs <- brRead $ responseBody res
+        unless (S.null bs) $ do
+            S.hPut stdout bs
+            loop
+
+-- | The computed value from a @UploadSettings@.
+--
+-- Typically, you want to use this with 'upload'.
+--
+-- Since 0.1.0.0
+data Uploader = Uploader
+    { upload_ :: !(String -> L.ByteString -> IO ())
+    }
+
+-- | Upload a single tarball with the given @Uploader@.
+--
+-- Since 0.1.0.0
+upload :: Uploader -> FilePath -> IO ()
+upload uploader fp = upload_ uploader (takeFileName fp) =<< L.readFile fp
+
+-- | Upload a single tarball with the given @Uploader@.  Instead of
+-- sending a file like 'upload', this sends a lazy bytestring.
+--
+-- Since 0.1.2.1
+uploadBytes :: Uploader -> String -> L.ByteString -> IO ()
+uploadBytes = upload_
+
+-- | Settings for creating an @Uploader@.
+--
+-- Since 0.1.0.0
+data UploadSettings = UploadSettings
+    { usUploadUrl   :: !String
+    , usGetManager  :: !(IO Manager)
+    , usCredsSource :: !(Config -> HackageCredsSource)
+    , usSaveCreds   :: !Bool
+    }
+
+-- | Default value for @UploadSettings@.
+--
+-- Use setter functions to change defaults.
+--
+-- Since 0.1.0.0
+defaultUploadSettings :: UploadSettings
+defaultUploadSettings = UploadSettings
+    { usUploadUrl = "https://hackage.haskell.org/packages/"
+    , usGetManager = newManager tlsManagerSettings
+    , usCredsSource = fromAnywhere
+    , usSaveCreds = True
+    }
+
+-- | Change the upload URL.
+--
+-- Default: "https://hackage.haskell.org/packages/"
+--
+-- Since 0.1.0.0
+setUploadUrl :: String -> UploadSettings -> UploadSettings
+setUploadUrl x us = us { usUploadUrl = x }
+
+-- | How to get an HTTP connection manager.
+--
+-- Default: @newManager tlsManagerSettings@
+--
+-- Since 0.1.0.0
+setGetManager :: IO Manager -> UploadSettings -> UploadSettings
+setGetManager x us = us { usGetManager = x }
+
+-- | How to get the Hackage credentials.
+--
+-- Default: @fromAnywhere@
+--
+-- Since 0.1.0.0
+setCredsSource :: (Config -> HackageCredsSource) -> UploadSettings -> UploadSettings
+setCredsSource x us = us { usCredsSource = x }
+
+-- | Save new credentials to the config file.
+--
+-- Default: @True@
+--
+-- Since 0.1.0.0
+setSaveCreds :: Bool -> UploadSettings -> UploadSettings
+setSaveCreds x us = us { usSaveCreds = x }
+
+handleIO :: (E.IOException -> IO a) -> IO a -> IO a
+handleIO = E.handle
+{-# LANGUAGE OverloadedStrings #-}
+
+module Stack.Config.Urls (urlsFromMonoid) where
+
+import           Stack.Types.Urls
+import           Data.Monoid.Extra
+
+urlsFromMonoid :: UrlsMonoid -> Urls
+urlsFromMonoid monoid =
+    Urls
+        (fromFirst defaultLatestSnapshot    $ urlsMonoidLatestSnapshot    monoid)
+        (fromFirst defaultLtsBuildPlans     $ urlsMonoidLtsBuildPlans     monoid)
+        (fromFirst defaultNightlyBuildPlans $ urlsMonoidNightlyBuildPlans monoid)
+    where
+    defaultLatestSnapshot =
+        "https://www.stackage.org/download/snapshots.json"
+    defaultLtsBuildPlans =
+        "https://raw.githubusercontent.com/fpco/lts-haskell/master/"
+    defaultNightlyBuildPlans =
+        "https://raw.githubusercontent.com/fpco/stackage-nightly/master/"
+{-# LANGUAGE CPP                   #-}
+{-# LANGUAGE DeriveDataTypeable    #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE PackageImports        #-}
+{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE ScopedTypeVariables   #-}
+{-# LANGUAGE RecordWildCards       #-}
+{-# LANGUAGE RankNTypes            #-}
+{-# LANGUAGE GADTs                 #-}
+{-# LANGUAGE StandaloneDeriving    #-}
+{-# LANGUAGE TemplateHaskell       #-}
+module Network.HTTP.Download.Verified
+  ( verifiedDownload
+  , recoveringHttp
+  , DownloadRequest(..)
+  , drRetryPolicyDefault
+  , HashCheck(..)
+  , CheckHexDigest(..)
+  , LengthCheck
+  , VerifiedDownloadException(..)
+  ) where
+
+import qualified    Data.List as List
+import qualified    Data.ByteString as ByteString
+import qualified    Data.ByteString.Base64 as B64
+import qualified    Data.Conduit.Binary as CB
+import qualified    Data.Conduit.List as CL
+import qualified    Data.Text as Text
+import qualified    Data.Text.Encoding as Text
+
+import              Control.Applicative
+import              Control.Monad
+import              Control.Monad.Catch
+import              Control.Monad.IO.Class
+import              Control.Monad.Logger (logDebug, MonadLogger)
+import              Control.Monad.Reader
+import              Control.Retry (recovering,limitRetries,RetryPolicy,constantDelay)
+import "cryptohash" Crypto.Hash
+import              Crypto.Hash.Conduit (sinkHash)
+import              Data.Byteable (toBytes)
+import              Data.ByteString (ByteString)
+import              Data.ByteString.Char8 (readInteger)
+import              Data.Conduit
+import              Data.Conduit.Binary (sourceHandle, sinkHandle)
+import              Data.Foldable (traverse_,for_)
+import              Data.Monoid
+import              Data.String
+import              Data.Text.Encoding (decodeUtf8With)
+import              Data.Text.Encoding.Error (lenientDecode)
+import              Data.Typeable (Typeable)
+import              GHC.IO.Exception (IOException(..),IOErrorType(..))
+import              Network.HTTP.Client.Conduit
+import              Network.HTTP.Types.Header (hContentLength, hContentMD5)
+import              Path
+import              Prelude -- Fix AMP warning
+import              System.Directory
+import              System.FilePath ((<.>))
+import              System.IO
+
+-- | A request together with some checks to perform.
+data DownloadRequest = DownloadRequest
+    { drRequest :: Request
+    , drHashChecks :: [HashCheck]
+    , drLengthCheck :: Maybe LengthCheck
+    , drRetryPolicy :: RetryPolicy
+    }
+
+-- | Default to retrying thrice with a short constant delay.
+drRetryPolicyDefault :: RetryPolicy
+drRetryPolicyDefault = limitRetries 3 <> constantDelay onehundredMilliseconds
+  where onehundredMilliseconds = 100000
+
+data HashCheck = forall a. (Show a, HashAlgorithm a) => HashCheck
+  { hashCheckAlgorithm :: a
+  , hashCheckHexDigest :: CheckHexDigest
+  }
+deriving instance Show HashCheck
+
+data CheckHexDigest
+  = CheckHexDigestString String
+  | CheckHexDigestByteString ByteString
+  | CheckHexDigestHeader ByteString
+  deriving Show
+instance IsString CheckHexDigest where
+  fromString = CheckHexDigestString
+
+type LengthCheck = Int
+
+-- | An exception regarding verification of a download.
+data VerifiedDownloadException
+    = WrongContentLength
+          Request
+          Int -- expected
+          ByteString -- actual (as listed in the header)
+    | WrongStreamLength
+          Request
+          Int -- expected
+          Int -- actual
+    | WrongDigest
+          Request
+          String -- algorithm
+          CheckHexDigest -- expected
+          String -- actual (shown)
+  deriving (Typeable)
+instance Show VerifiedDownloadException where
+    show (WrongContentLength req expected actual) =
+        "Download expectation failure: ContentLength header\n"
+        ++ "Expected: " ++ show expected ++ "\n"
+        ++ "Actual:   " ++ displayByteString actual ++ "\n"
+        ++ "For: " ++ show (getUri req)
+    show (WrongStreamLength req expected actual) =
+        "Download expectation failure: download size\n"
+        ++ "Expected: " ++ show expected ++ "\n"
+        ++ "Actual:   " ++ show actual ++ "\n"
+        ++ "For: " ++ show (getUri req)
+    show (WrongDigest req algo expected actual) =
+        "Download expectation failure: content hash (" ++ algo ++  ")\n"
+        ++ "Expected: " ++ displayCheckHexDigest expected ++ "\n"
+        ++ "Actual:   " ++ show actual ++ "\n"
+        ++ "For: " ++ show (getUri req)
+
+instance Exception VerifiedDownloadException
+
+-- This exception is always caught and never thrown outside of this module.
+data VerifyFileException
+    = WrongFileSize
+          Int -- expected
+          Integer -- actual (as listed by hFileSize)
+  deriving (Show, Typeable)
+instance Exception VerifyFileException
+
+-- Show a ByteString that is known to be UTF8 encoded.
+displayByteString :: ByteString -> String
+displayByteString =
+    Text.unpack . Text.strip . Text.decodeUtf8
+
+-- Show a CheckHexDigest in human-readable format.
+displayCheckHexDigest :: CheckHexDigest -> String
+displayCheckHexDigest (CheckHexDigestString s) = s ++ " (String)"
+displayCheckHexDigest (CheckHexDigestByteString s) = displayByteString s ++ " (ByteString)"
+displayCheckHexDigest (CheckHexDigestHeader h) =
+      show (B64.decodeLenient h) ++ " (Header. unencoded: " ++ show h ++ ")"
+
+
+-- | Make sure that the hash digest for a finite stream of bytes
+-- is as expected.
+--
+-- Throws WrongDigest (VerifiedDownloadException)
+sinkCheckHash :: MonadThrow m
+    => Request
+    -> HashCheck
+    -> Consumer ByteString m ()
+sinkCheckHash req HashCheck{..} = do
+    digest <- sinkHashUsing hashCheckAlgorithm
+    let actualDigestString = show digest
+    let actualDigestHexByteString = digestToHexByteString digest
+    let actualDigestBytes = toBytes digest
+
+    let passedCheck = case hashCheckHexDigest of
+          CheckHexDigestString s -> s == actualDigestString
+          CheckHexDigestByteString b -> b == actualDigestHexByteString
+          CheckHexDigestHeader b -> B64.decodeLenient b == actualDigestHexByteString
+            || B64.decodeLenient b == actualDigestBytes
+            -- A hack to allow hackage tarballs to download.
+            -- They should really base64-encode their md5 header as per rfc2616#sec14.15.
+            -- https://github.com/commercialhaskell/stack/issues/240
+            || b == actualDigestHexByteString
+
+    unless passedCheck $
+        throwM $ WrongDigest req (show hashCheckAlgorithm) hashCheckHexDigest actualDigestString
+
+assertLengthSink :: MonadThrow m
+    => Request
+    -> LengthCheck
+    -> ZipSink ByteString m ()
+assertLengthSink req expectedStreamLength = ZipSink $ do
+  Sum actualStreamLength <- CL.foldMap (Sum . ByteString.length)
+  when (actualStreamLength /= expectedStreamLength) $
+    throwM $ WrongStreamLength req expectedStreamLength actualStreamLength
+
+-- | A more explicitly type-guided sinkHash.
+sinkHashUsing :: (Monad m, HashAlgorithm a) => a -> Consumer ByteString m (Digest a)
+sinkHashUsing _ = sinkHash
+
+-- | Turns a list of hash checks into a ZipSink that checks all of them.
+hashChecksToZipSink :: MonadThrow m => Request -> [HashCheck] -> ZipSink ByteString m ()
+hashChecksToZipSink req = traverse_ (ZipSink . sinkCheckHash req)
+
+-- 'Control.Retry.recovering' customized for HTTP failures
+recoveringHttp :: (MonadMask m, MonadIO m)
+               => RetryPolicy -> m a -> m a
+recoveringHttp retryPolicy =
+#if MIN_VERSION_retry(0,7,0)
+    recovering retryPolicy handlers . const
+#else
+    recovering retryPolicy handlers
+#endif
+  where
+    handlers = [const $ Handler alwaysRetryHttp,const $ Handler retrySomeIO]
+
+    alwaysRetryHttp :: Monad m => HttpException -> m Bool
+    alwaysRetryHttp _ = return True
+
+    retrySomeIO :: Monad m => IOException -> m Bool
+    retrySomeIO e = return $ case ioe_type e of
+                               -- hGetBuf: resource vanished (Connection reset by peer)
+                               ResourceVanished -> True
+                               -- conservatively exclude all others
+                               _ -> False
+
+-- | Copied and extended version of Network.HTTP.Download.download.
+--
+-- Has the following additional features:
+-- * Verifies that response content-length header (if present)
+--     matches expected length
+-- * Limits the download to (close to) the expected # of bytes
+-- * Verifies that the expected # bytes were downloaded (not too few)
+-- * Verifies md5 if response includes content-md5 header
+-- * Verifies the expected hashes
+--
+-- Throws VerifiedDownloadException.
+-- Throws IOExceptions related to file system operations.
+-- Throws HttpException.
+verifiedDownload :: (MonadReader env m, HasHttpManager env, MonadIO m, MonadLogger m)
+         => DownloadRequest
+         -> Path Abs File -- ^ destination
+         -> (Maybe Integer -> Sink ByteString (ReaderT env IO) ()) -- ^ custom hook to observe progress
+         -> m Bool -- ^ Whether a download was performed
+verifiedDownload DownloadRequest{..} destpath progressSink = do
+    let req = drRequest
+    env <- ask
+    whenM' (liftIO getShouldDownload) $ do
+        $logDebug $ "Downloading " <> decodeUtf8With lenientDecode (path req)
+        liftIO $ do
+            createDirectoryIfMissing True dir
+            withBinaryFile fptmp WriteMode $ \h ->
+                recoveringHttp drRetryPolicy $
+                    flip runReaderT env $
+                        withResponse req (go h)
+            renameFile fptmp fp
+  where
+    whenM' mp m = do
+        p <- mp
+        if p then m >> return True else return False
+
+    fp = toFilePath destpath
+    fptmp = fp <.> "tmp"
+    dir = toFilePath $ parent destpath
+
+    getShouldDownload = do
+        fileExists <- doesFileExist fp
+        if fileExists
+            -- only download if file does not match expectations
+            then not <$> fileMatchesExpectations
+            -- or if it doesn't exist yet
+            else return True
+
+    -- precondition: file exists
+    -- TODO: add logging
+    fileMatchesExpectations =
+        ((checkExpectations >> return True)
+          `catch` \(_ :: VerifyFileException) -> return False)
+          `catch` \(_ :: VerifiedDownloadException) -> return False
+
+    checkExpectations = bracket (openFile fp ReadMode) hClose $ \h -> do
+        for_ drLengthCheck $ checkFileSizeExpectations h
+        sourceHandle h $$ getZipSink (hashChecksToZipSink drRequest drHashChecks)
+
+    -- doesn't move the handle
+    checkFileSizeExpectations h expectedFileSize = do
+        fileSizeInteger <- hFileSize h
+        when (fileSizeInteger > toInteger (maxBound :: Int)) $
+            throwM $ WrongFileSize expectedFileSize fileSizeInteger
+        let fileSize = fromInteger fileSizeInteger
+        when (fileSize /= expectedFileSize) $
+            throwM $ WrongFileSize expectedFileSize fileSizeInteger
+
+    checkContentLengthHeader headers expectedContentLength =
+        case List.lookup hContentLength headers of
+            Just lengthBS -> do
+              let lengthStr = displayByteString lengthBS
+              when (lengthStr /= show expectedContentLength) $
+                throwM $ WrongContentLength drRequest expectedContentLength lengthBS
+            _ -> return ()
+
+    go h res = do
+        let headers = responseHeaders res
+            mcontentLength = do
+              hLength <- List.lookup hContentLength headers
+              (i,_) <- readInteger hLength
+              return i
+        for_ drLengthCheck $ checkContentLengthHeader headers
+        let hashChecks = (case List.lookup hContentMD5 headers of
+                Just md5BS ->
+                    [ HashCheck
+                          { hashCheckAlgorithm = MD5
+                          , hashCheckHexDigest = CheckHexDigestHeader md5BS
+                          }
+                    ]
+                Nothing -> []
+                ) ++ drHashChecks
+
+        responseBody res
+            $= maybe (awaitForever yield) CB.isolate drLengthCheck
+            $$ getZipSink
+                ( hashChecksToZipSink drRequest hashChecks
+                  *> maybe (pure ()) (assertLengthSink drRequest) drLengthCheck
+                  *> ZipSink (sinkHandle h)
+                  *> ZipSink (progressSink mcontentLength))
+{-# LANGUAGE RecordWildCards #-}
+module Network.HTTP.Download.VerifiedSpec where
+
+import Crypto.Hash
+import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.Logger (LoggingT, runStdoutLoggingT)
+import Control.Monad.Trans.Reader
+import Control.Retry (limitRetries)
+import Data.Maybe
+import Network.HTTP.Client.Conduit
+import Network.HTTP.Download.Verified
+import Path
+import Path.IO
+import Test.Hspec
+
+-- TODO: share across test files
+withTempDir' :: (Path Abs Dir -> IO a) -> IO a
+withTempDir' = withSystemTempDir "NHD_VerifiedSpec"
+
+-- | An example path to download the exampleReq.
+getExamplePath :: Path Abs Dir -> IO (Path Abs File)
+getExamplePath dir = do
+    file <- parseRelFile "cabal-install-1.22.4.0.tar.gz"
+    return (dir </> file)
+
+-- | An example DownloadRequest that uses a SHA1
+exampleReq :: DownloadRequest
+exampleReq = fromMaybe (error "exampleReq") $ do
+    let req = parseRequest_ "http://download.fpcomplete.com/stackage-cli/linux64/cabal-install-1.22.4.0.tar.gz"
+    return DownloadRequest
+        { drRequest = req
+        , drHashChecks = [exampleHashCheck]
+        , drLengthCheck = Just exampleLengthCheck
+        , drRetryPolicy = limitRetries 1
+        }
+
+exampleHashCheck :: HashCheck
+exampleHashCheck = HashCheck
+    { hashCheckAlgorithm = SHA1
+    , hashCheckHexDigest = CheckHexDigestString "b98eea96d321cdeed83a201c192dac116e786ec2"
+    }
+
+exampleLengthCheck :: LengthCheck
+exampleLengthCheck = 302513
+
+-- | The wrong ContentLength for exampleReq
+exampleWrongContentLength :: Int
+exampleWrongContentLength = 302512
+
+-- | The wrong SHA1 digest for exampleReq
+exampleWrongDigest :: CheckHexDigest
+exampleWrongDigest = CheckHexDigestString "b98eea96d321cdeed83a201c192dac116e786ec3"
+
+exampleWrongContent :: String
+exampleWrongContent = "example wrong content"
+
+isWrongContentLength :: VerifiedDownloadException -> Bool
+isWrongContentLength WrongContentLength{} = True
+isWrongContentLength _ = False
+
+isWrongDigest :: VerifiedDownloadException -> Bool
+isWrongDigest WrongDigest{} = True
+isWrongDigest _ = False
+
+data T = T
+  { manager :: Manager
+  }
+
+runWith :: MonadIO m => Manager -> ReaderT Manager (LoggingT m) r -> m r
+runWith manager = runStdoutLoggingT . flip runReaderT manager
+
+setup :: IO T
+setup = do
+  manager <- newManager
+  return T{..}
+
+teardown :: T -> IO ()
+teardown _ = return ()
+
+spec :: Spec
+spec = beforeAll setup $ afterAll teardown $ do
+  let exampleProgressHook _ = return ()
+
+  describe "verifiedDownload" $ do
+    -- Preconditions:
+    -- * the exampleReq server is running
+    -- * the test runner has working internet access to it
+    it "downloads the file correctly" $ \T{..} -> withTempDir' $ \dir -> do
+      examplePath <- getExamplePath dir
+      doesFileExist examplePath `shouldReturn` False
+      let go = runWith manager $ verifiedDownload exampleReq examplePath exampleProgressHook
+      go `shouldReturn` True
+      doesFileExist examplePath `shouldReturn` True
+
+    it "is idempotent, and doesn't redownload unnecessarily" $ \T{..} -> withTempDir' $ \dir -> do
+      examplePath <- getExamplePath dir
+      doesFileExist examplePath `shouldReturn` False
+      let go = runWith manager $ verifiedDownload exampleReq examplePath exampleProgressHook
+      go `shouldReturn` True
+      doesFileExist examplePath `shouldReturn` True
+      go `shouldReturn` False
+      doesFileExist examplePath `shouldReturn` True
+
+    -- https://github.com/commercialhaskell/stack/issues/372
+    it "does redownload when the destination file is wrong" $ \T{..} -> withTempDir' $ \dir -> do
+      examplePath <- getExamplePath dir
+      let exampleFilePath = toFilePath examplePath
+      writeFile exampleFilePath exampleWrongContent
+      doesFileExist examplePath `shouldReturn` True
+      readFile exampleFilePath `shouldReturn` exampleWrongContent
+      let go = runWith manager $ verifiedDownload exampleReq examplePath exampleProgressHook
+      go `shouldReturn` True
+      doesFileExist examplePath `shouldReturn` True
+      readFile exampleFilePath `shouldNotReturn` exampleWrongContent
+
+    it "rejects incorrect content length" $ \T{..} -> withTempDir' $ \dir -> do
+      examplePath <- getExamplePath dir
+      let wrongContentLengthReq = exampleReq
+            { drLengthCheck = Just exampleWrongContentLength
+            }
+      let go = runWith manager $ verifiedDownload wrongContentLengthReq examplePath exampleProgressHook
+      go `shouldThrow` isWrongContentLength
+      doesFileExist examplePath `shouldReturn` False
+
+    it "rejects incorrect digest" $ \T{..} -> withTempDir' $ \dir -> do
+      examplePath <- getExamplePath dir
+      let wrongHashCheck = exampleHashCheck { hashCheckHexDigest = exampleWrongDigest }
+      let wrongDigestReq = exampleReq { drHashChecks = [wrongHashCheck] }
+      let go = runWith manager $ verifiedDownload wrongDigestReq examplePath exampleProgressHook
+      go `shouldThrow` isWrongDigest
+      doesFileExist examplePath `shouldReturn` False
+
+    -- https://github.com/commercialhaskell/stack/issues/240
+    it "can download hackage tarballs" $ \T{..} -> withTempDir' $ \dir -> do
+      dest <- fmap (dir </>) $ parseRelFile "acme-missiles-0.3.tar.gz"
+      let req = parseRequest_ "http://hackage.haskell.org/package/acme-missiles-0.3/acme-missiles-0.3.tar.gz"
+      let dReq = DownloadRequest
+            { drRequest = req
+            , drHashChecks = []
+            , drLengthCheck = Nothing
+            , drRetryPolicy = limitRetries 1
+            }
+      let go = runWith manager $ verifiedDownload dReq dest exampleProgressHook
+      doesFileExist dest `shouldReturn` False
+      go `shouldReturn` True
+      doesFileExist dest `shouldReturn` True
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+
+-- | Versions for packages.
+
+module Stack.Types.Version
+  (Version
+  ,Cabal.VersionRange -- TODO in the future should have a newtype wrapper
+  ,IntersectingVersionRange(..)
+  ,VersionCheck(..)
+  ,versionParser
+  ,parseVersion
+  ,parseVersionFromString
+  ,versionString
+  ,versionText
+  ,toCabalVersion
+  ,fromCabalVersion
+  ,mkVersion
+  ,versionRangeText
+  ,withinRange
+  ,Stack.Types.Version.intersectVersionRanges
+  ,toMajorVersion
+  ,latestApplicableVersion
+  ,checkVersion
+  ,nextMajorVersion)
+  where
+
+import           Control.Applicative
+import           Control.DeepSeq
+import           Control.Monad.Catch
+import           Data.Aeson.Extended
+import           Data.Attoparsec.Text
+import           Data.Data
+import           Data.Hashable
+import           Data.List
+import           Data.Map (Map)
+import qualified Data.Map as Map
+import           Data.Maybe (listToMaybe)
+import           Data.Monoid
+import           Data.Set (Set)
+import qualified Data.Set as Set
+import           Data.Store (Store)
+import           Data.Text (Text)
+import qualified Data.Text as T
+import           Data.Vector.Unboxed (Vector)
+import qualified Data.Vector.Unboxed as V
+import           Data.Word
+import           Distribution.Text (disp)
+import qualified Distribution.Version as Cabal
+import           GHC.Generics
+import           Language.Haskell.TH
+import           Language.Haskell.TH.Syntax
+import           Prelude -- Fix warning: Word in Prelude from base-4.8.
+import           Text.PrettyPrint (render)
+
+-- | A parse fail.
+data VersionParseFail =
+  VersionParseFail Text
+  deriving (Typeable)
+instance Exception VersionParseFail
+instance Show VersionParseFail where
+    show (VersionParseFail bs) = "Invalid version: " ++ show bs
+
+-- | A package version.
+newtype Version =
+  Version {unVersion :: Vector Word}
+  deriving (Eq,Ord,Typeable,Data,Generic,Store,NFData)
+
+instance Hashable Version where
+  hashWithSalt i = hashWithSalt i . V.toList . unVersion
+
+instance Lift Version where
+  lift (Version n) =
+    appE (conE 'Version)
+         (appE (varE 'V.fromList)
+               (listE (map (litE . IntegerL . fromIntegral)
+                           (V.toList n))))
+
+instance Show Version where
+  show (Version v) =
+    intercalate "."
+                (map show (V.toList v))
+
+instance ToJSON Version where
+  toJSON = toJSON . versionText
+instance FromJSON Version where
+  parseJSON j =
+    do s <- parseJSON j
+       case parseVersionFromString s of
+         Nothing ->
+           fail ("Couldn't parse package version: " ++ s)
+         Just ver -> return ver
+instance FromJSON a => FromJSON (Map Version a) where
+    parseJSON val = do
+        m <- parseJSON val
+        fmap Map.fromList $ mapM go $ Map.toList m
+      where
+        go (k, v) = do
+            k' <- either (fail . show) return $ parseVersionFromString k
+            return (k', v)
+
+newtype IntersectingVersionRange =
+    IntersectingVersionRange { getIntersectingVersionRange :: Cabal.VersionRange }
+    deriving Show
+
+instance Monoid IntersectingVersionRange where
+    mempty = IntersectingVersionRange Cabal.anyVersion
+    mappend (IntersectingVersionRange l) (IntersectingVersionRange r) =
+        IntersectingVersionRange (l `Cabal.intersectVersionRanges` r)
+
+-- | Attoparsec parser for a package version.
+versionParser :: Parser Version
+versionParser =
+  do ls <- ((:) <$> num <*> many num')
+     let !v = V.fromList ls
+     return (Version v)
+  where num = decimal
+        num' = point *> num
+        point = satisfy (== '.')
+
+-- | Convenient way to parse a package version from a 'Text'.
+parseVersion :: MonadThrow m => Text -> m Version
+parseVersion x = go x
+  where go =
+          either (const (throwM (VersionParseFail x))) return .
+          parseOnly (versionParser <* endOfInput)
+
+-- | Migration function.
+parseVersionFromString :: MonadThrow m => String -> m Version
+parseVersionFromString =
+  parseVersion . T.pack
+
+-- | Get a string representation of a package version.
+versionString :: Version -> String
+versionString (Version v) =
+  intercalate "."
+              (map show (V.toList v))
+
+-- | Get a string representation of a package version.
+versionText :: Version -> Text
+versionText (Version v) =
+  T.intercalate
+    "."
+    (map (T.pack . show)
+         (V.toList v))
+
+-- | Convert to a Cabal version.
+toCabalVersion :: Version -> Cabal.Version
+toCabalVersion (Version v) =
+  Cabal.Version (map fromIntegral (V.toList v)) []
+
+-- | Convert from a Cabal version.
+fromCabalVersion :: Cabal.Version -> Version
+fromCabalVersion (Cabal.Version vs _) =
+  let !v = V.fromList (map fromIntegral vs)
+  in Version v
+
+-- | Make a package version.
+mkVersion :: String -> Q Exp
+mkVersion s =
+  case parseVersionFromString s of
+    Nothing -> error ("Invalid package version: " ++ show s)
+    Just pn -> [|pn|]
+
+-- | Display a version range
+versionRangeText :: Cabal.VersionRange -> Text
+versionRangeText = T.pack . render . disp
+
+-- | Check if a version is within a version range.
+withinRange :: Version -> Cabal.VersionRange -> Bool
+withinRange v r = toCabalVersion v `Cabal.withinRange` r
+
+-- | A modified intersection which also simplifies, for better display.
+intersectVersionRanges :: Cabal.VersionRange -> Cabal.VersionRange -> Cabal.VersionRange
+intersectVersionRanges x y = Cabal.simplifyVersionRange $ Cabal.intersectVersionRanges x y
+
+-- | Returns the first two components, defaulting to 0 if not present
+toMajorVersion :: Version -> Version
+toMajorVersion  (Version v) =
+    case V.length v of
+        0 -> Version (V.fromList [0,        0])
+        1 -> Version (V.fromList [V.head v, 0])
+        _ -> Version (V.fromList [V.head v, v V.! 1])
+
+-- | Given a version range and a set of versions, find the latest version from
+-- the set that is within the range.
+latestApplicableVersion :: Cabal.VersionRange -> Set Version -> Maybe Version
+latestApplicableVersion r = listToMaybe . filter (`withinRange` r) . Set.toDescList
+
+-- | Get the next major version number for the given version
+nextMajorVersion :: Version -> Version
+nextMajorVersion (Version v) =
+  case  V.length v of
+    0 -> Version (V.fromList [0,        1])
+    1 -> Version (V.fromList [V.head v, 1])
+    _ -> Version (V.fromList [V.head v, (v V.! 1) + 1])
+
+data VersionCheck
+    = MatchMinor
+    | MatchExact
+    | NewerMinor
+    deriving (Show, Eq, Ord)
+instance ToJSON VersionCheck where
+    toJSON MatchMinor = String "match-minor"
+    toJSON MatchExact = String "match-exact"
+    toJSON NewerMinor = String "newer-minor"
+instance FromJSON VersionCheck where
+    parseJSON = withText expected $ \t ->
+        case t of
+            "match-minor" -> return MatchMinor
+            "match-exact" -> return MatchExact
+            "newer-minor" -> return NewerMinor
+            _ -> fail ("Expected " ++ expected ++ ", but got " ++ show t)
+      where
+        expected = "VersionCheck value (match-minor, match-exact, or newer-minor)"
+
+checkVersion :: VersionCheck -> Version -> Version -> Bool
+checkVersion check (Version wanted) (Version actual) =
+    case check of
+        MatchMinor -> V.and (V.take 3 matching)
+        MatchExact -> V.length wanted == V.length actual && V.and matching
+        NewerMinor -> V.and (V.take 2 matching) && newerMinor
+  where
+    matching = V.zipWith (==) wanted actual
+    newerMinor =
+        case (wanted V.!? 2, actual V.!? 2) of
+            (Nothing, _) -> True
+            (Just _, Nothing) -> False
+            (Just w, Just a) -> a >= w
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE ConstraintKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ViewPatterns #-}
+-- | Tag a Store instance with structural version info to ensure we're
+-- reading a compatible format.
+module Data.Store.VersionTagged
+    ( versionedEncodeFile
+    , versionedDecodeOrLoad
+    , versionedDecodeFile
+    , storeVersionConfig
+    ) where
+
+import Control.Applicative
+import Control.Exception.Lifted (catch, IOException, assert)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Logger
+import Control.Monad.Trans.Control (MonadBaseControl)
+import qualified Data.ByteString as BS
+import Data.Data (Data)
+import qualified Data.Map as M
+import Data.Monoid ((<>))
+import qualified Data.Set as S
+import Data.Store
+import Data.Store.Version
+import qualified Data.Text as T
+import Language.Haskell.TH
+import Path
+import Path.IO (ensureDir)
+import Prelude
+
+versionedEncodeFile :: Data a => VersionConfig a -> Q Exp
+versionedEncodeFile vc = [e| \fp x -> storeEncodeFile fp ($(wrapVersion vc) x) |]
+
+versionedDecodeOrLoad :: Data a => VersionConfig a -> Q Exp
+versionedDecodeOrLoad vc = [| versionedDecodeOrLoadImpl $(wrapVersion vc) $(checkVersion vc) |]
+
+versionedDecodeFile :: Data a => VersionConfig a -> Q Exp
+versionedDecodeFile vc = [e| versionedDecodeFileImpl $(checkVersion vc) |]
+
+-- | Write to the given file.
+storeEncodeFile :: (Store a, MonadIO m, MonadLogger m, Eq a)
+                => Path Abs File
+                -> a
+                -> m ()
+storeEncodeFile fp x = do
+    let fpt = T.pack (toFilePath fp)
+    $logDebug $ "Encoding " <> fpt
+    ensureDir (parent fp)
+    let encoded = encode x
+    assert (decodeEx encoded == x) $ liftIO $ BS.writeFile (toFilePath fp) encoded
+    $logDebug $ "Finished writing " <> fpt
+
+-- | Read from the given file. If the read fails, run the given action and
+-- write that back to the file. Always starts the file off with the
+-- version tag.
+versionedDecodeOrLoadImpl :: (Store a, Eq a, MonadIO m, MonadLogger m, MonadBaseControl IO m)
+                          => (a -> WithVersion a)
+                          -> (WithVersion a -> Either VersionCheckException a)
+                          -> Path Abs File
+                          -> m a
+                          -> m a
+versionedDecodeOrLoadImpl wrap check fp mx = do
+    let fpt = T.pack (toFilePath fp)
+    $logDebug $ "Trying to decode " <> fpt
+    mres <- versionedDecodeFileImpl check fp
+    case mres of
+        Just x -> do
+            $logDebug $ "Success decoding " <> fpt
+            return x
+        _ -> do
+            $logDebug $ "Failure decoding " <> fpt
+            x <- mx
+            storeEncodeFile fp (wrap x)
+            return x
+
+versionedDecodeFileImpl :: (Store a, MonadIO m, MonadLogger m, MonadBaseControl IO m)
+                        => (WithVersion a -> Either VersionCheckException a)
+                        -> Path loc File
+                        -> m (Maybe a)
+versionedDecodeFileImpl check fp = do
+    mbs <- liftIO (Just <$> BS.readFile (toFilePath fp)) `catch` \(err :: IOException) -> do
+        $logDebug ("Exception ignored when attempting to load " <> T.pack (toFilePath fp) <> ": " <> T.pack (show err))
+        return Nothing
+    case mbs of
+        Nothing -> return Nothing
+        Just bs ->
+            liftIO (do decoded <- decodeIO bs
+                       return $ case check decoded of
+                           Right res -> Just res
+                           _ -> Nothing) `catch` \(err :: PeekException) -> do
+                 let fpt = T.pack (toFilePath fp)
+                 $logDebug ("Error while decoding " <> fpt <> ": " <> T.pack (show err) <> " (this might not be an error, when switching between stack versions)")
+                 return Nothing
+
+storeVersionConfig :: String -> String -> VersionConfig a
+storeVersionConfig name hash = (namedVersionConfig name hash)
+    { vcIgnore = S.fromList
+        [ "Data.Vector.Unboxed.Base.Vector GHC.Types.Word"
+        , "Data.ByteString.Internal.ByteString"
+        ]
+    , vcRenames = M.fromList
+        [ ( "Data.Maybe.Maybe", "GHC.Base.Maybe") ]
+    }
+module Пσε
+    ( θυπε
+    ) where
+
+θυπε :: String
+θυπε = "以呂波耳本部止"

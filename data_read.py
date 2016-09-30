@@ -8,13 +8,15 @@ def file_string(filename):
 		return f.read()		
 
 
-def data_and_labels(cut=2000):
+def data_and_labels(pre='test', cut=2000):
+
+        path = pre+'_data/'
 
 	filenames = filter(lambda x: not x.startswith('.'), 
-	            filter(os.path.isfile, ['data/'+i for i in os.listdir('data')])) 
+	            filter(os.path.isfile, [path+i for i in os.listdir(path)])) 
 	# yo dawg i heard you like filter...
 	
-	n = 200 # block size 
+	n = 1000 # block size 
 
 	texts  = np.zeros((0,n)) 
 	labels = []
@@ -34,8 +36,8 @@ def data_and_labels(cut=2000):
 		texts = np.vstack((texts, char_arr))
 		labels.extend(lab)	
 
-	#for i, v in enumerate(np.unique(texts)):
-    	#	texts[np.where(texts == v)] = i
+	for i, v in enumerate(np.unique(texts)):
+    		texts[np.where(texts == v)] = i
 					
 	return texts, labels
 
@@ -43,15 +45,16 @@ def batch_iter(data, batch_size, num_epochs):
     """
     Generates a batch iterator for a dataset.
     """
-    data = np.array(data)
-    data_size = len(data)
-    num_batches_per_epoch = int(len(data)/batch_size) + 1
-    for epoch in range(num_epochs):
+
+        data = np.array(data)
+        data_size = len(data)
+        num_batches_per_epoch = int(len(data)/batch_size) + 1
+        for epoch in range(num_epochs):
         # Shuffle the data at each epoch
-	shuffle_indices = np.random.permutation(np.arange(data_size))
-     	shuffled_data = data[shuffle_indices]
+	        shuffle_indices = np.random.permutation(np.arange(data_size))
+     	        shuffled_data = data[shuffle_indices]
         
         for batch_num in range(num_batches_per_epoch):
-            start_index = batch_num * batch_size
-            end_index = min((batch_num + 1) * batch_size, data_size)
-            yield shuffled_data[start_index:end_index]
+                start_index = batch_num * batch_size
+                end_index = min((batch_num + 1) * batch_size, data_size)
+                yield shuffled_data[start_index:end_index]
