@@ -29,9 +29,9 @@ FLAGS._parse_flags()
 
 
 
-features, labels = dtr.data_and_labels()
+features, labels = dtr.data_and_labels(pre='train')
 labels = np.array(labels)
-vocab = 103
+vocab = max(np.ravel(features))
 
 
 # Randomly shuffle data

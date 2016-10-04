@@ -39,13 +39,12 @@ def data_and_labels(pre='test', cut=2000):
 	for i, v in enumerate(np.unique(texts)):
     		texts[np.where(texts == v)] = i
 					
-	return texts, labels
+        return texts.astype(int), labels
 
 def batch_iter(data, batch_size, num_epochs):
-    """
-    Generates a batch iterator for a dataset.
-    """
-
+        """
+        Generates a batch iterator for a dataset.
+        """
         data = np.array(data)
         data_size = len(data)
         num_batches_per_epoch = int(len(data)/batch_size) + 1

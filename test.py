@@ -26,7 +26,7 @@ FLAGS = tf.flags.FLAGS
 FLAGS._parse_flags()
 print("\nParameters:")
 
-x_test, y_test = dtr.data_and_labels()
+x_test, y_test = dtr.data_and_labels(pre='test')
 
 
 print("\nEvaluating...\n")
