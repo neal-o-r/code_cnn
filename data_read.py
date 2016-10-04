@@ -8,7 +8,7 @@ def file_string(filename):
 		return f.read()		
 
 
-def data_and_labels(pre='test', cut=2000):
+def data_and_labels(pre='test', cut=1000):
 
         path = pre+'_data/'
 
@@ -53,7 +53,7 @@ def batch_iter(data, batch_size, num_epochs):
 	        shuffle_indices = np.random.permutation(np.arange(data_size))
      	        shuffled_data = data[shuffle_indices]
         
-        for batch_num in range(num_batches_per_epoch):
-                start_index = batch_num * batch_size
-                end_index = min((batch_num + 1) * batch_size, data_size)
-                yield shuffled_data[start_index:end_index]
+	for batch_num in range(num_batches_per_epoch):
+		start_index = batch_num * batch_size
+		end_index = min((batch_num + 1) * batch_size, data_size)
+		yield shuffled_data[start_index:end_index]
