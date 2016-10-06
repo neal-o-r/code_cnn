@@ -59,7 +59,7 @@ with tf.Graph().as_default():
     with sess.as_default():
         cnn = TextCNN(
             sequence_length=x_train.shape[1],
-            num_classes=2,
+            num_classes=len(y_train[0]),
             vocab_size=vocab,
             embedding_size=FLAGS.embedding_dim,
             filter_sizes=list(map(int, FLAGS.filter_sizes.split(","))),
@@ -105,7 +105,7 @@ with tf.Graph().as_default():
                 [train_op, global_step, train_summary_op, cnn.loss, cnn.accuracy],
                 feed_dict)
             
-           # print("step {}, loss {:g}, acc {:g}".format(step, loss, accuracy))
+            print("step {}, loss {:g}, acc {:g}".format(step, loss, accuracy))
 
         def dev_step(x_batch, y_batch):
             """
@@ -126,13 +126,16 @@ with tf.Graph().as_default():
             list(zip(x_train, y_train)), FLAGS.batch_size, FLAGS.num_epochs)
         # Training loop. For each batch...
         for batch in batches:
+
             x_batch, y_batch = zip(*batch)
             train_step(x_batch, y_batch)
             current_step = tf.train.global_step(sess, global_step)
+            
             if current_step % FLAGS.evaluate_every == 0:
                 print("\nEvaluation:")
                 dev_step(x_dev, y_dev)
                 print("")
+
 	    if current_step == FLAGS.num_epochs*(int(len(x_train)/FLAGS.batch_size)+1):
 		path = saver.save(sess, out_dir, global_step=current_step)
 		print("Saved model to {}\n".format(path))

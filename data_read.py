@@ -16,7 +16,7 @@ def data_and_labels(pre='test', cut=1000):
 	            filter(os.path.isfile, [path+i for i in os.listdir(path)])) 
 	# yo dawg i heard you like filter...
 	
-	n = 1000 # block size 
+	n = 200 # block size 
 
 	texts  = np.zeros((0,n)) 
 	labels = []
@@ -26,8 +26,8 @@ def data_and_labels(pre='test', cut=1000):
 
 		f_str = f_str[:cut*n]	
 
-		char_arr = np.array([i for i in f_str])
-		char_arr = char_arr[:len(char_arr)//n *n]
+		char_arr = np.array([ord(i) for i in f_str])
+		
 		char_arr = char_arr.reshape((len(char_arr)+1)//n, n)		
 		
 		lab = [0]*len(filenames)
@@ -35,11 +35,8 @@ def data_and_labels(pre='test', cut=1000):
 		lab = [lab] * char_arr.shape[0]
 		texts = np.vstack((texts, char_arr))
 		labels.extend(lab)	
-
-	for i, v in enumerate(np.unique(texts)):
-    		texts[np.where(texts == v)] = i
-					
-        return texts.astype(int), labels
+	
+        return texts, labels
 
 def batch_iter(data, batch_size, num_epochs):
         """
@@ -53,7 +50,7 @@ def batch_iter(data, batch_size, num_epochs):
 	        shuffle_indices = np.random.permutation(np.arange(data_size))
      	        shuffled_data = data[shuffle_indices]
         
-	for batch_num in range(num_batches_per_epoch):
-		start_index = batch_num * batch_size
-		end_index = min((batch_num + 1) * batch_size, data_size)
-		yield shuffled_data[start_index:end_index]
+	        for batch_num in range(num_batches_per_epoch):
+		        start_index = batch_num * batch_size
+		        end_index = min((batch_num + 1) * batch_size, data_size)
+	        	yield shuffled_data[start_index:end_index]

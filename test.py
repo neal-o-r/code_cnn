@@ -26,14 +26,14 @@ FLAGS = tf.flags.FLAGS
 FLAGS._parse_flags()
 print("\nParameters:")
 
-x_test, y_test = dtr.data_and_labels(pre='test', cut=100)
+x_test, y_test = dtr.data_and_labels(pre='train', cut=1000)
 
 
 print("\nEvaluating...\n")
 
 # Evaluation
 # ==================================================
-checkpoint_file = 'outs-5600'
+checkpoint_file = 'outs-300'
 graph = tf.Graph()
 with graph.as_default():
     session_conf = tf.ConfigProto(
